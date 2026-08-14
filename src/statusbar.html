@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: #161b22; color: #8b949e;
+    font: 11px "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex; align-items: center; padding: 0 10px; gap: 10px;
+    user-select: none; white-space: nowrap; overflow: hidden;
+  }
+  .seg { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+  .seg .lb { color: #6e7681; }
+  .seg .vl { color: #c9d1d9; font-variant-numeric: tabular-nums; }
+  #dot { width: 7px; height: 7px; border-radius: 50%; background: #d29922; }
+  body.online #dot { background: #3fb950; }
+  body.offline #dot { background: #f85149; }
+  .spacer { flex: 1; min-width: 6px; }
+  .group { display: inline-flex; align-items: center; gap: 10px; flex: none; }
+  .sep { width: 1px; height: 14px; background: #30363d; flex: none; }
+  button {
+    background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 4px; padding: 1px 9px; font-size: 11px; cursor: pointer; flex: none;
+  }
+  button:hover { background: #30363d; }
+  button.danger:hover { background: #3d1a1a; border-color: #da3633; color: #ffa198; }
+  #time { color: #6e7681; flex: none; }
+  .ellip { overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body>
+  <span class="seg"><span id="dot"></span><span class="vl" id="svc">检测中…</span></span>
+  <span class="seg"><span class="lb">模型</span><span class="vl ellip" id="model" style="max-width:130px">—</span></span>
+  <span class="seg"><span class="lb">方式</span><span class="vl" id="mode">—</span></span>
+  <span class="spacer"></span>
+  <span class="group">
+    <span class="seg"><span class="lb">会话tokens</span><span class="vl" id="sessTokens">—</span></span>
+    <span class="seg"><span class="lb">本次tokens</span><span class="vl" id="thisTokens">—</span></span>
+    <span class="seg"><span class="lb">本次费用</span><span class="vl" id="thisCost">—</span></span>
+    <span class="sep"></span>
+    <span class="seg"><span class="lb">会话费用</span><span class="vl" id="sessCost">—</span></span>
+    <span class="seg"><span class="lb">余额</span><span class="vl" id="balance">—</span></span>
+  </span>
+  <span class="spacer"></span>
+  <button id="settings">设置</button>
+  <button id="quit" class="danger">退出</button>
+  <span id="time"></span>
+<script>
+  const $ = id => document.getElementById(id);
+  async function refresh() {
+    try {
+      const s = await window.statusApi.getStatus();
+      document.body.className = s.online ? 'online' : 'offline';
+      $('svc').textContent = s.online ? 'DSH 在线' : 'DSH 离线';
+      $('model').textContent = s.model || '—';
+      $('model').title = s.model || '';
+      $('mode').textContent = s.mode || '—';
+      $('sessTokens').textContent = s.sessTokens;
+      $('thisTokens').textContent = s.thisTokens;
+      $('thisCost').textContent = s.thisCost;
+      $('sessCost').textContent = s.sessCost;
+      $('balance').textContent = s.balance;
+    } catch (e) {
+      document.body.className = 'offline';
+      $('svc').textContent = 'DSH 离线';
+    }
+  }
+  setInterval(refresh, 5000);
+  refresh();
+  setInterval(() => { $('time').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false }); }, 1000);
+  $('settings').onclick = () => window.statusApi.openSettings();
+  $('quit').onclick = () => window.statusApi.quit();
+</script>
+</body>
+</html>

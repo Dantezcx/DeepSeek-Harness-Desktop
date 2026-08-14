@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DSH 客户端 - 设置</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: #0d1117; color: #e6edf3; font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    padding: 22px 26px; overflow-y: auto; min-width: 460px;
+  }
+  h1 { font-size: 16px; margin-bottom: 18px; color: #58a6ff; font-weight: 600; }
+  h2 { font-size: 13px; margin: 20px 0 10px; color: #8b949e; font-weight: 600; }
+  .row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .row label { font-size: 13px; flex: none; width: 110px; color: #c9d1d9; }
+  .row small { display: block; color: #6e7681; font-size: 11px; margin-top: 3px; }
+  input[type=text], input[type=password], input[type=number], select {
+    background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px;
+    padding: 6px 10px; font-size: 13px; flex: 1; min-width: 0;
+  }
+  input[type=checkbox] { width: 16px; height: 16px; accent-color: #58a6ff; }
+  .chk { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 13px; cursor: pointer; }
+  .actions { margin-top: 18px; display: flex; gap: 10px; align-items: center; }
+  button { background: #238636; color: #fff; border: 0; padding: 8px 20px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #30363d; cursor: not-allowed; }
+  button.secondary { background: #21262d; color: #e6edf3; border: 1px solid #30363d; }
+  button.secondary:hover { background: #30363d; }
+  button.danger { background: #da3633; }
+  button.danger:hover { background: #f85149; }
+  .status { font-size: 12px; color: #8b949e; margin-left: 8px; }
+  .status.ok { color: #3fb950; } .status.err { color: #f85149; }
+  .sep { border: 0; border-top: 1px solid #21262d; margin: 16px 0; }
+  .hint { color: #8b949e; font-size: 11px; line-height: 1.7; }
+</style>
+</head>
+<body>
+  <h1>DSH 客户端设置</h1>
+
+  <div class="row">
+    <input type="checkbox" id="closeToTray" style="flex:none">
+    <label for="closeToTray" style="width:auto">关闭窗口时最小化到任务栏
+      <small>勾选后点击 X 不退出，最小化到任务栏（服务继续运行）；退出请用托盘图标右键 → 退出。</small>
+    </label>
+  </div>
+
+  <hr class="sep">
+  <h2>同步设置</h2>
+
+  <div class="row">
+    <label>同步方式</label>
+    <select id="syncMethod">
+      <option value="off">关闭</option>
+      <option value="git">Git</option>
+      <option value="webdav">WebDAV</option>
+    </select>
+  </div>
+
+  <div id="gitBox" style="display:none">
+    <div class="row">
+      <label>Git 远程地址</label>
+      <input type="text" id="gitRemote" placeholder="https://user:TOKEN@github.com/you/dsh-sync.git 或 ssh://...">
+    </div>
+  </div>
+
+  <div id="webdavBox" style="display:none">
+    <div class="row">
+      <label>WebDAV 地址</label>
+      <input type="text" id="davUrl" placeholder="https://dav.jianguoyun.com/dav">
+    </div>
+    <div class="row">
+      <label>用户名</label>
+      <input type="text" id="davUser" placeholder="坚果云账号邮箱">
+    </div>
+    <div class="row">
+      <label>密码</label>
+      <input type="password" id="davPass" placeholder="应用密码">
+    </div>
+  </div>
+
+  <h2>同步内容</h2>
+  <label class="chk"><input type="checkbox" id="cSessions"> 会话记录（sessions/）</label>
+  <label class="chk"><input type="checkbox" id="cApi"> API 配置（.credentials.yaml）<small style="display:block;color:#d29922">同步到云端有泄露风险，请确认目标可信</small></label>
+  <label class="chk"><input type="checkbox" id="cSettings"> 设置与工作区状态</label>
+
+  <div class="row" style="margin-top:8px">
+    <input type="checkbox" id="autoSync" style="flex:none">
+    <label for="autoSync" style="width:auto">自动同步
+      <small>客户端启动后延迟 1 分钟开始，按间隔循环</small>
+    </label>
+    <input type="number" id="syncInterval" min="1" style="width:70px;flex:none" title="间隔（分钟）">
+    <span style="font-size:12px;color:#8b949e">分钟</span>
+  </div>
+
+  <div class="actions" id="syncActions" style="display:none">
+    <button id="save">保存设置</button>
+    <button id="syncBtn" class="secondary">立即同步</button>
+    <button id="restoreBtn" class="danger" style="background:#da3633">从云端恢复</button>
+    <span id="status" class="status"></span>
+  </div>
+  <div class="hint" id="syncHint" style="margin-top:12px">
+    说明：Git 方式用「立即同步」推送/拉取，「从云端恢复」回滚到云端最新；<br>
+    会话文件为压缩二进制，WebDAV 上传下载按修改时间比较；两端同时修改时以时间较新者为准。<br>
+    WebDAV 密码以明文保存在本地配置（%APPDATA%\dsh-client\config.json），请知悉。
+  </div>
+
+  <div id="backupBox" style="display:none">
+    <hr class="sep">
+    <h2>备份管理（压缩包快照）</h2>
+    <div class="actions">
+      <button id="backupBtn">创建备份并上传</button>
+      <button id="listBtn" class="secondary">刷新备份列表</button>
+      <span id="backupStatus" class="status"></span>
+    </div>
+    <div id="backupList" style="margin-top:10px"></div>
+    <div class="hint" style="margin-top:8px">备份 = 把会话/API/设置打包成带日期的 tar.gz 直接上传到 WebDAV 根目录（保留最近 10 份）；恢复时按日期选择，会覆盖本地。</div>
+  </div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  let cfg = { method: 'off', git: {}, webdav: {}, content: { sessions: true, api: false, settings: true }, auto: false, intervalMin: 30 };
+
+  function apply() {
+    $('syncMethod').value = cfg.method || 'off';
+    const m = cfg.method || 'off';
+    $('gitBox').style.display = m === 'git' ? '' : 'none';
+    $('webdavBox').style.display = m === 'webdav' ? '' : 'none';
+    $('syncActions').style.display = m === 'git' ? '' : 'none';
+    $('syncHint').style.display = m === 'git' ? '' : 'none';
+    $('backupBox').style.display = m === 'webdav' ? '' : 'none';
+    $('gitRemote').value = (cfg.git && cfg.git.remote) || '';
+    $('davUrl').value = (cfg.webdav && cfg.webdav.url) || '';
+    $('davUser').value = (cfg.webdav && cfg.webdav.user) || '';
+    $('davPass').value = (cfg.webdav && cfg.webdav.pass) || '';
+    $('cSessions').checked = !!(cfg.content && cfg.content.sessions);
+    $('cApi').checked = !!(cfg.content && cfg.content.api);
+    $('cSettings').checked = !!(cfg.content && cfg.content.settings);
+    $('autoSync').checked = !!cfg.auto;
+    $('syncInterval').value = cfg.intervalMin || 30;
+    $('status').textContent = cfg.lastStatus ? ('上次：' + new Date(cfg.lastSync).toLocaleString('zh-CN', { hour12: false }) + ' — ' + cfg.lastStatus) : '';
+    $('status').className = 'status' + (cfg.lastStatus && /成功|完成/.test(cfg.lastStatus) ? ' ok' : ' err');
+  }
+
+  $('syncMethod').onchange = () => {
+    const m = $('syncMethod').value;
+    $('gitBox').style.display = m === 'git' ? '' : 'none';
+    $('webdavBox').style.display = m === 'webdav' ? '' : 'none';
+    $('syncActions').style.display = m === 'git' ? '' : 'none';
+    $('syncHint').style.display = m === 'git' ? '' : 'none';
+    $('backupBox').style.display = m === 'webdav' ? '' : 'none';
+  };
+
+  $('save').onclick = async () => {
+    cfg.method = $('syncMethod').value;
+    cfg.git = { remote: $('gitRemote').value.trim() };
+    cfg.webdav = {
+      url: $('davUrl').value.trim(),
+      user: $('davUser').value.trim(),
+      pass: $('davPass').value,
+    };
+    cfg.content = { sessions: $('cSessions').checked, api: $('cApi').checked, settings: $('cSettings').checked };
+    cfg.auto = $('autoSync').checked;
+    cfg.intervalMin = parseInt($('syncInterval').value, 10) || 30;
+    const saved = await window.api.saveSyncConfig(cfg);
+    $('status').textContent = '设置已保存';
+    $('status').className = 'status ok';
+    setTimeout(() => { if (!cfg.lastStatus) $('status').textContent = ''; }, 2000);
+    if (saved) { cfg = saved; apply(); }
+  };
+
+  $('syncBtn').onclick = async () => {
+    $('syncBtn').disabled = true;
+    $('status').textContent = '同步中…';
+    $('status').className = 'status';
+    const r = await window.api.syncNow();
+    $('status').textContent = r.ok ? '✓ ' + r.msg : '✗ ' + r.msg;
+    $('status').className = 'status ' + (r.ok ? 'ok' : 'err');
+    $('syncBtn').disabled = false;
+    const c2 = await window.api.getSyncConfig();
+    if (c2) { cfg = c2; apply(); }
+  };
+
+  $('restoreBtn').onclick = async () => {
+    if (!confirm('从云端恢复会用云端文件覆盖本地（本地未同步的改动会丢失）。\n确认继续？')) return;
+    $('restoreBtn').disabled = true;
+    $('status').textContent = '恢复中…';
+    $('status').className = 'status';
+    const r = await window.api.restoreSync();
+    $('status').textContent = r.ok ? '✓ ' + r.msg : '✗ ' + r.msg;
+    $('status').className = 'status ' + (r.ok ? 'ok' : 'err');
+    $('restoreBtn').disabled = false;
+    if (r.ok) $('status').textContent += '（建议重启客户端生效）';
+    const c2 = await window.api.getSyncConfig();
+    if (c2) { cfg = c2; apply(); }
+  };
+
+  // ---- backup management ----
+  const bList = $('backupList');
+  function renderBackups(items) {
+    if (!items.length) { bList.innerHTML = '<div style="color:#8b949e;font-size:12px">暂无备份，先点「创建备份并上传」</div>'; return; }
+    bList.innerHTML = items.map((b, i) => `
+      <div style="display:flex;align-items:center;gap:10px;padding:6px 8px;border:1px solid #21262d;border-radius:6px;margin-bottom:6px;background:#161b22">
+        <span style="font-size:12px;color:#e6edf3;flex:none;width:150px">${b.date}</span>
+        <span style="font-size:11px;color:#8b949e;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${b.name}">${b.name}</span>
+        <span style="font-size:11px;color:#6e7681;flex:none">${b.size ? (b.size/1024).toFixed(0)+'KB' : '—'}</span>
+        <button class="secondary" style="padding:2px 12px;font-size:11px" onclick="window.__restore('${b.name.replace(/'/g, "\\'")}')">恢复</button>
+      </div>`).join('');
+  }
+  window.__restore = async (name) => {
+    if (!confirm('从备份 ' + name + ' 恢复将覆盖本地数据，确认？')) return;
+    $('backupStatus').textContent = '恢复中…';
+    $('backupStatus').className = 'status';
+    const r = await window.api.backupRestore(name);
+    $('backupStatus').textContent = r.ok ? '✓ ' + r.msg : '✗ ' + r.msg;
+    $('backupStatus').className = 'status ' + (r.ok ? 'ok' : 'err');
+  };
+  $('backupBtn').onclick = async () => {
+    $('backupBtn').disabled = true;
+    $('backupStatus').textContent = '打包上传中…';
+    $('backupStatus').className = 'status';
+    const r = await window.api.backupCreate();
+    $('backupStatus').textContent = r.ok ? '✓ ' + r.msg : '✗ ' + r.msg;
+    $('backupStatus').className = 'status ' + (r.ok ? 'ok' : 'err');
+    $('backupBtn').disabled = false;
+    const lr = await window.api.backupList();
+    if (lr.ok) renderBackups(lr.items);
+  };
+  $('listBtn').onclick = async () => {
+    $('listBtn').disabled = true;
+    const r = await window.api.backupList();
+    $('listBtn').disabled = false;
+    if (r.ok) renderBackups(r.items);
+    else { $('backupStatus').textContent = '✗ ' + r.msg; $('backupStatus').className = 'status err'; }
+  };
+  window.api.backupList().then((r) => { if (r.ok) renderBackups(r.items); });
+
+  window.api.getSyncConfig().then(c => { if (c) { cfg = c; } apply(); });
+  window.api.getConfig().then(c => { if (c) $('closeToTray').checked = !!c.closeToTray; });
+  $('closeToTray').onchange = () => window.api.setConfig({ closeToTray: $('closeToTray').checked });
+</script>
+</body>
+</html>

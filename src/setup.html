@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DSH 客户端 - 环境检测</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: #0d1117; color: #e6edf3;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .card {
+    width: 560px; background: #161b22; border: 1px solid #30363d;
+    border-radius: 12px; padding: 28px 32px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+  .sub { color: #8b949e; font-size: 13px; margin-bottom: 20px; }
+  .row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 0; border-bottom: 1px solid #21262d; font-size: 14px;
+  }
+  .row:last-of-type { border-bottom: 0; }
+  .row .name { color: #c9d1d9; }
+  .row .state { display: flex; align-items: center; gap: 8px; }
+  .ok { color: #3fb950; }
+  .miss { color: #f85149; }
+  .badge {
+    font-size: 12px; padding: 2px 10px; border-radius: 999px; font-weight: 600;
+  }
+  .badge.ok { background: #12261d; border: 1px solid #238636; }
+  .badge.miss { background: #2d1617; border: 1px solid #da3633; }
+  .actions { margin-top: 20px; display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    background: #238636; color: #fff; border: 0; padding: 9px 20px;
+    border-radius: 6px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #30363d; cursor: not-allowed; }
+  button.secondary { background: #21262d; color: #e6edf3; border: 1px solid #30363d; }
+  button.secondary:hover { background: #30363d; }
+  #log {
+    margin-top: 16px; background: #0d1117; border: 1px solid #21262d;
+    border-radius: 8px; padding: 10px 12px; height: 150px; overflow-y: auto;
+    font-family: Consolas, monospace; font-size: 12px; color: #8b949e;
+    white-space: pre-wrap; display: none;
+  }
+  #log div { margin-bottom: 2px; }
+  #note { margin-top: 14px; font-size: 12px; color: #8b949e; line-height: 1.6; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>环境检测</h1>
+    <div class="sub">首次运行需要以下组件，缺失的将自动为您安装</div>
+    <div class="row">
+      <span class="name">Node.js</span>
+      <span class="state"><span id="nodeText">检测中…</span><span id="nodeBadge" class="badge">…</span></span>
+    </div>
+    <div class="row">
+      <span class="name">npm / npx</span>
+      <span class="state"><span id="npmText">检测中…</span><span id="npmBadge" class="badge">…</span></span>
+    </div>
+    <div class="row">
+      <span class="name">dsh（DeepSeek Harness）</span>
+      <span class="state"><span id="dshText">检测中…</span><span id="dshBadge" class="badge">…</span></span>
+    </div>
+    <div class="actions">
+      <button id="installBtn" style="display:none">一键安装缺失组件</button>
+      <button id="retryBtn" class="secondary">重新检测</button>
+      <button id="skipBtn" class="secondary">跳过（稍后再说）</button>
+    </div>
+    <div id="log"></div>
+    <div id="note">
+      安装 Node.js 时会弹出 UAC 授权窗口，请点击“是”。安装完成后自动继续安装 dsh。<br>
+      一键安装会下载官方安装包并使用国内镜像加速，整个过程需要几分钟。
+    </div>
+  </div>
+<script>
+  const $ = id => document.getElementById(id);
+  function setState(key, ok) {
+    const text = $({ node: 'nodeText', npm: 'npmText', dsh: 'dshText' }[key]);
+    const badge = $({ node: 'nodeBadge', npm: 'npmBadge', dsh: 'dshBadge' }[key]);
+    if (ok) { text.textContent = '已安装'; text.className = 'ok'; badge.textContent = '✓'; badge.className = 'badge ok'; }
+    else { text.textContent = '未安装'; text.className = 'miss'; badge.textContent = '✗'; badge.className = 'badge miss'; }
+  }
+  function showLog() { $('log').style.display = 'block'; }
+  function addLog(msg) {
+    showLog();
+    const d = document.createElement('div');
+    d.textContent = '> ' + msg;
+    $('log').appendChild(d);
+    $('log').scrollTop = $('log').scrollHeight;
+  }
+  async function check() {
+    $('retryBtn').disabled = true;
+    $('nodeText').textContent = '检测中…';
+    $('npmText').textContent = '检测中…';
+    $('dshText').textContent = '检测中…';
+    const env = await window.api.checkEnv();
+    setState('node', env.node);
+    setState('npm', env.npm);
+    setState('dsh', env.dsh);
+    const missing = !env.node || !env.npm || !env.dsh;
+    $('installBtn').style.display = missing ? '' : 'none';
+    $('retryBtn').disabled = false;
+    if (!missing) { addLog('所有组件已就绪'); }
+  }
+  window.api.onSetupProgress(addLog);
+  $('retryBtn').onclick = check;
+  $('skipBtn').onclick = () => window.api.skipSetup();
+  $('installBtn').onclick = async () => {
+    $('installBtn').disabled = true;
+    $('skipBtn').disabled = true;
+    addLog('开始一键安装...');
+    await window.api.installSetup();
+    addLog('安装流程结束，重新检测...');
+    await check();
+    $('installBtn').disabled = false;
+    $('skipBtn').disabled = false;
+  };
+  check();
+</script>
+</body>
+</html>
