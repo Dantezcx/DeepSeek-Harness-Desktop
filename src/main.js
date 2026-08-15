@@ -744,19 +744,26 @@ async function restoreNow() {
   log('restore result: ' + result.msg);
   return result;
 }
+let autoSyncTimers = [];
 function scheduleAutoSync() {
   const s = config.sync || {};
-  if (!s.auto) return;
+  clearAutoSyncTimers();
+  if (!s.auto) { log('auto sync: disabled (auto=false), timers cleared'); return; }
   const mins = Math.max(1, Number(s.intervalMin) || 30);
-  setTimeout(() => {
-    syncNow();
-    setInterval(syncNow, mins * 60000);
-  }, 60000);
+  const first = setTimeout(() => { syncNow(); }, 60000);
+  const iv = setInterval(syncNow, mins * 60000);
+  autoSyncTimers = [first, iv];
+  log('auto sync: scheduled (first in 60s, then every ' + mins + ' min)');
+}
+function clearAutoSyncTimers() {
+  for (const t of autoSyncTimers) { try { clearTimeout(t); clearInterval(t); } catch (e) {} }
+  autoSyncTimers = [];
 }
 ipcMain.handle('sync:get-config', () => (config.sync || {}));
 ipcMain.handle('sync:save-config', (e, sc) => {
   config.sync = sc;
   saveConfig();
+  scheduleAutoSync();
   return config.sync;
 });
 ipcMain.handle('sync:now', () => syncNow());
