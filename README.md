@@ -19,7 +19,7 @@
 
 ## 🚀 一键安装
 
-- **Windows 安装包**：下载 `install-dsh-v1.1.0.exe`，双击安装（可自定义目录 + 自动创建桌面快捷方式）
+- **Windows 安装包**：下载 `install-dsh-v1.1.6.exe`，双击安装（可自定义目录 + 自动创建桌面快捷方式）
 - **便携版**：解压 `win-unpacked/`，双击 `DSH客户端.exe` 即用
 - **更新日志**：详见 [CHANGELOG.md](CHANGELOG.md)
 - **环境自检**：首次启动自动检测 Node.js / npm / dsh / pnpm，缺失时**一键安装**（国内镜像下载 + UAC 静默安装 + 自动装 dsh），并自动安装 dsh-web-ui 全家桶 / 插件市场 / 对话导入插件（安装即使用）
