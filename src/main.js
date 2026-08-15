@@ -85,7 +85,7 @@ async function getBalance() {
 }
 
 // ---- config ----
-let config = { closeToTray: true };
+let config = { closeToTray: true, stopOnExit: false, autoStart: false };
 try { config = { ...config, ...JSON.parse(fs.readFileSync(CONFIG, 'utf8')) }; } catch (e) {}
 function saveConfig() {
   try { fs.writeFileSync(CONFIG, JSON.stringify(config, null, 2)); log('config saved: ' + JSON.stringify(config)); }
@@ -254,9 +254,30 @@ async function setupInstall() {
 // ---- quit ----
 async function quitApp() {
   forceQuit = true;
-  log('quitApp: stopping service on port ' + PORT);
-  await killByPort(PORT);
+  if (config.stopOnExit) {
+    log('quitApp: stopping service (stopOnExit)');
+    await killByPort(PORT);
+  } else {
+    log('quitApp: keeping dsh service running (常驻)');
+  }
   app.quit();
+}
+
+// ---- autostart (registry Run key) ----
+async function setAutoStart(on) {
+  const runKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+  try {
+    if (on) {
+      await execCmd('reg', ['add', runKey, '/v', 'DSHClient', '/t', 'REG_SZ', '/d', '"' + process.execPath + '" --autostart', '/f']);
+    } else {
+      await execCmd('reg', ['delete', runKey, '/v', 'DSHClient', '/f']);
+    }
+    log('autostart ' + (on ? 'enabled' : 'disabled'));
+    return { ok: true };
+  } catch (e) {
+    log('autostart error: ' + e.message);
+    return { ok: false, msg: e.message };
+  }
 }
 
 // ---- settings window ----
@@ -348,6 +369,13 @@ async function bootWeb() {
 }
 
 app.whenReady().then(async () => {
+  const isAutoStart = process.argv.includes('--autostart');
+  if (isAutoStart) {
+    log('autostart mode: silent service boot');
+    await ensureServer();
+    createTray();
+    return; // tray-only, no window
+  }
   win = new BrowserWindow({
     width: 1440, height: 900,
     backgroundColor: '#0d1117',
@@ -394,7 +422,15 @@ app.whenReady().then(async () => {
 });
 
 ipcMain.handle('config:get', () => config);
-ipcMain.handle('config:set', (e, cfg) => { config = { ...config, ...cfg }; saveConfig(); return config; });
+ipcMain.handle('config:set', (e, cfg) => {
+  const prevAuto = config.autoStart;
+  config = { ...config, ...cfg };
+  if (cfg.autoStart !== undefined && cfg.autoStart !== prevAuto) {
+    setAutoStart(!!cfg.autoStart);
+  }
+  saveConfig();
+  return config;
+});
 ipcMain.handle('setup:check', () => checkEnv());
 ipcMain.handle('setup:install', () => setupInstall());
 ipcMain.handle('setup:skip', async () => { await bootWeb(); return 'ok'; });
@@ -725,6 +761,34 @@ ipcMain.handle('sync:save-config', (e, sc) => {
 });
 ipcMain.handle('sync:now', () => syncNow());
 ipcMain.handle('sync:restore', () => restoreNow());
+// plugin description -> AI explanation via DeepSeek (uses dsh's configured key)
+ipcMain.handle('translate:text', async (e, text) => {
+  try {
+    const cred = path.join(process.env.USERPROFILE || '', '.dsh', '.credentials.yaml');
+    const key = fs.existsSync(cred) ? String(fs.readFileSync(cred, 'utf8')).match(/sk-[a-zA-Z0-9]+/) : null;
+    if (!key) return { ok: false, msg: '未配置 API Key（请在 dsh 设置中配置）' };
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key[0] },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: '你是插件说明助手。用户会给你一个 DeepSeek Harness（DSH）插件的名称和英文介绍。请用简体中文简洁说明：这个插件是做什么的、能实现什么功能。50~150 字，用 2~4 个要点，不要逐句翻译原文。' },
+          { role: 'user', content: String(text).slice(0, 2000) },
+        ],
+        max_tokens: 500,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const j = await res.json();
+    const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+    if (!content) return { ok: false, msg: 'AI 无返回: ' + (j.error ? j.error.message : 'unknown') };
+    return { ok: true, text: content.trim() };
+  } catch (err) {
+    return { ok: false, msg: 'AI 解释失败: ' + err.message };
+  }
+});
 ipcMain.handle('sync:test', async (e, p) => {
   try {
     if (p && p.method === 'git') {
@@ -931,7 +995,10 @@ ipcMain.handle('overview:get', async () => {
 });
 
 app.on('window-all-closed', async () => {
-  log('window-all-closed: stopping service on port ' + PORT);
-  await killByPort(PORT);
+  log('window-all-closed');
+  if (config.stopOnExit) {
+    log('stopping service (stopOnExit)');
+    await killByPort(PORT);
+  }
   app.quit();
 });

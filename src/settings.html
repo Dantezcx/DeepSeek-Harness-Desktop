@@ -48,6 +48,20 @@
     </label>
   </div>
 
+  <div class="row">
+    <input type="checkbox" id="stopOnExit" style="flex:none">
+    <label for="stopOnExit" style="width:auto">退出时停止 dsh 服务
+      <small>默认关闭：退出客户端后服务常驻后台，下次打开秒进（更快）；勾选后退出即停。</small>
+    </label>
+  </div>
+
+  <div class="row">
+    <input type="checkbox" id="autoStart" style="flex:none">
+    <label for="autoStart" style="width:auto">开机自启（静默启动服务）
+      <small>登录系统后自动在后台启动 dsh 服务，打开客户端无需等待（无窗口，托盘常驻）。</small>
+    </label>
+  </div>
+
   <hr class="sep">
   <h2>同步设置</h2>
 
@@ -373,8 +387,10 @@
   };
 
   window.api.getSyncConfig().then(c => { if (c) { cfg = c; } apply(); });
-  window.api.getConfig().then(c => { if (c) $('closeToTray').checked = !!c.closeToTray; });
+  window.api.getConfig().then(c => { if (c) { $('closeToTray').checked = !!c.closeToTray; $('stopOnExit').checked = !!c.stopOnExit; $('autoStart').checked = !!c.autoStart; } });
   $('closeToTray').onchange = () => window.api.setConfig({ closeToTray: $('closeToTray').checked });
+  $('stopOnExit').onchange = () => window.api.setConfig({ stopOnExit: $('stopOnExit').checked });
+  $('autoStart').onchange = () => window.api.setConfig({ autoStart: $('autoStart').checked });
 </script>
 </body>
 </html>
