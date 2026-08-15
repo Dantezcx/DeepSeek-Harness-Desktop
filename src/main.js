@@ -766,7 +766,7 @@ ipcMain.handle('translate:text', async (e, text) => {
   try {
     const cred = path.join(process.env.USERPROFILE || '', '.dsh', '.credentials.yaml');
     const key = fs.existsSync(cred) ? String(fs.readFileSync(cred, 'utf8')).match(/sk-[a-zA-Z0-9]+/) : null;
-    if (!key) return { ok: false, msg: '未配置 API Key（请在 dsh 设置中配置）' };
+    if (!key) return '未配置 API Key（请在 dsh 设置中配置）';
     const res = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key[0] },
@@ -783,10 +783,10 @@ ipcMain.handle('translate:text', async (e, text) => {
     });
     const j = await res.json();
     const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
-    if (!content) return { ok: false, msg: 'AI 无返回: ' + (j.error ? j.error.message : 'unknown') };
-    return { ok: true, text: content.trim() };
+    if (!content) return 'AI 无返回: ' + (j.error ? j.error.message : 'unknown');
+    return content.trim();
   } catch (err) {
-    return { ok: false, msg: 'AI 解释失败: ' + err.message };
+    return 'AI 解释失败: ' + err.message;
   }
 });
 ipcMain.handle('sync:test', async (e, p) => {
