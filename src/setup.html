@@ -106,6 +106,7 @@
     $('installBtn').style.display = missing ? '' : 'none';
     $('retryBtn').disabled = false;
     if (!missing) { addLog('所有组件已就绪'); }
+    return env;
   }
   window.api.onSetupProgress(addLog);
   $('retryBtn').onclick = check;
@@ -116,7 +117,13 @@
     addLog('开始一键安装...');
     await window.api.installSetup();
     addLog('安装流程结束，重新检测...');
-    await check();
+    const env = await check();
+    if (env && env.node && env.npm && env.dsh) {
+      addLog('所有组件已就绪，正在进入主界面...');
+      await window.api.skipSetup();
+      return;
+    }
+    addLog('仍有组件未就绪，可点击「重新检测」或「跳过」');
     $('installBtn').disabled = false;
     $('skipBtn').disabled = false;
   };
