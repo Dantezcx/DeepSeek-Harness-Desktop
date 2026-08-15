@@ -725,6 +725,37 @@ ipcMain.handle('sync:save-config', (e, sc) => {
 });
 ipcMain.handle('sync:now', () => syncNow());
 ipcMain.handle('sync:restore', () => restoreNow());
+ipcMain.handle('sync:test', async (e, p) => {
+  try {
+    if (p && p.method === 'git') {
+      const remote = (p.remote || '').trim();
+      if (!remote) return { ok: false, msg: '未填写 Git 远程地址' };
+      const r = await execGitTimeout(['ls-remote', remote], 15000);
+      return { ok: true, msg: 'Git 连接成功（远程可访问）' };
+    }
+    const url = ((p && p.webdav && p.webdav.url) || '').trim().replace(/\/+$/, '');
+    const user = (p && p.webdav && p.webdav.user) || '';
+    const pass = (p && p.webdav && p.webdav.pass) || '';
+    if (!url || !user || !pass) return { ok: false, msg: 'WebDAV 配置不完整（地址/用户名/密码）' };
+    const auth = davAuth(user, pass);
+    const res = await davFetch('PROPFIND', url + '/', { headers: { Authorization: auth, Depth: '0' }, timeout: 15000 });
+    if (res.ok) return { ok: true, msg: 'WebDAV 连接成功（HTTP ' + res.status + '）' };
+    return { ok: false, msg: 'WebDAV 连接失败（HTTP ' + res.status + '，检查地址/认证/目录权限）' };
+  } catch (e) {
+    return { ok: false, msg: '连接失败: ' + e.message };
+  }
+});
+function execGitTimeout(args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const c = spawn('git', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    c.stdout.on('data', (d) => out += d.toString());
+    c.stderr.on('data', (d) => out += d.toString());
+    const t = setTimeout(() => { try { c.kill(); } catch (e) {} reject(new Error('连接超时（15 秒）')); }, timeoutMs || 15000);
+    c.on('error', (e) => { clearTimeout(t); reject(e); });
+    c.on('exit', (code) => { clearTimeout(t); code === 0 ? resolve(out) : reject(new Error('git 连接失败 exit ' + code + ': ' + out.slice(-120))); });
+  });
+}
 
 // ==================== backup packs (webdav tar.gz snapshots) ====================
 function execTar(args) {
@@ -817,6 +848,8 @@ async function backupRestore(name) {
     await killByPort(PORT);
     await execTar(['-xzf', tmp, '-C', DSH_DIR]);
     fs.unlinkSync(tmp);
+    // self-heal: restored profile may carry invalid bundles (e.g. dsh-plugin-marketplace)
+    try { if (fixProfileBundles()) log('restore: fixed invalid profile bundles'); } catch (e) { log('restore fixProfileBundles: ' + e.message); }
     // restart dsh so it loads the restored sessions/workspace
     await ensureServer();
     if (webView && !webView.webContents.isDestroyed()) {
