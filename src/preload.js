@@ -11,16 +11,16 @@ contextBridge.exposeInMainWorld('api', {
   onSetupProgress: (cb) => ipcRenderer.on('setup:progress', (e, m) => cb(m)),
   getSyncConfig: () => ipcRenderer.invoke('sync:get-config'),
   saveSyncConfig: (sc) => ipcRenderer.invoke('sync:save-config', sc),
-  testSync: (p) => ipcRenderer.invoke('sync:test', p),
   syncNow: () => ipcRenderer.invoke('sync:now'),
   restoreSync: () => ipcRenderer.invoke('sync:restore'),
   backupCreate: () => ipcRenderer.invoke('backup:create'),
   backupList: () => ipcRenderer.invoke('backup:list'),
   backupRestore: (name) => ipcRenderer.invoke('backup:restore', name),
-  translateText: (text) => ipcRenderer.invoke('translate:text', text),
+  installPlugin: (info) => ipcRenderer.invoke('plugin:install', info),
   rulesScan: () => ipcRenderer.invoke('rules:scan'),
-  rulesImport: (f) => ipcRenderer.invoke('rules:import', f),
-  restartService: () => ipcRenderer.invoke('service:restart'),
+  rulesImport: (sel) => ipcRenderer.invoke('rules:import', sel),
+  searchPlugins: (params) => ipcRenderer.invoke('plugin:search', params),
+  getReadme: (fullName) => ipcRenderer.invoke('plugin:readme', fullName),
 });
 
 // ============ overview injection (dsh-web-ui "概览" tab) ============

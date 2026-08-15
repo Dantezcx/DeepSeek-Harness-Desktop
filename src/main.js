@@ -211,9 +211,9 @@ function progress(msg) {
 }
 
 // heartbeat-aware exec: reports progress every interval ms while the command runs
-function execCmdLive(cmd, args, interval, onTick) {
+function execCmdLive(cmd, args, interval, onTick, opts) {
   return new Promise((resolve, reject) => {
-    const c = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const c = spawn(cmd, args, Object.assign({ windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }, opts || {}));
     let out = '';
     c.stdout.on('data', (d) => out += d.toString());
     c.stderr.on('data', (d) => out += d.toString());
@@ -761,6 +761,184 @@ ipcMain.handle('sync:save-config', (e, sc) => {
 });
 ipcMain.handle('sync:now', () => syncNow());
 ipcMain.handle('sync:restore', () => restoreNow());
+
+// ==================== inherit external AI rules ====================
+const RULE_CANDIDATES = [
+  ['Claude Code', ['CLAUDE.md', '.claude/CLAUDE.md', '.claude/CLAUDE.local.md']],
+  ['Cursor', ['.cursor/rules/*.mdc', '.cursorrules', '.cursor/rules/*.md']],
+  ['Gemini', ['GEMINI.md', '.gemini/GEMINI.md']],
+  ['Codex', ['CODEX.md', '.codex/CODEX.md']],
+  ['Copilot', ['.github/copilot-instructions.md']],
+  ['DSH', ['.dsh/AGENTS.md', 'AGENTS.md', '.dsh/REASONIX.md', 'REASONIX.md']],
+];
+function expandRules() {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const cwd = process.cwd();
+  const roots = [home, cwd, path.join(home, 'AppData', 'Roaming', 'Claude')];
+  const out = [];
+  for (const [tool, pats] of RULE_CANDIDATES) {
+    for (const p of pats) {
+      const hasGlob = p.includes('*');
+      if (!hasGlob) {
+        for (const r of roots) {
+          const f = path.join(r, p.split('/').join(path.sep));
+          if (fs.existsSync(f) && fs.statSync(f).isFile()) out.push({ name: tool + ' — ' + f, path: f, size: fs.statSync(f).size });
+        }
+      } else {
+        const dir = path.join(cwd, p.slice(0, p.indexOf('*')).replace(/\//g, path.sep));
+        if (fs.existsSync(dir)) {
+          for (const f of fs.readdirSync(dir)) {
+            const full = path.join(dir, f);
+            if (fs.statSync(full).isFile()) out.push({ name: tool + ' — ' + full, path: full, size: fs.statSync(full).size });
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+ipcMain.handle('plugin:readme', async (e, fullName) => {
+  try {
+    if (!fullName) return null;
+    const res = await fetch('https://api.github.com/repos/' + fullName + '/readme', { headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'dsh-client' }, signal: AbortSignal.timeout(20000) });
+    if (!res.ok) return null;
+    const j = await res.json();
+    if (!j.content) return null;
+    return Buffer.from(j.content, 'base64').toString('utf8');
+  } catch (err) { log('plugin:readme error: ' + err.message); return null; }
+});
+ipcMain.handle('rules:scan', () => {
+  try {
+    const list = expandRules().map((x) => ({ name: x.name, path: x.path, size: x.size }));
+    log('rules:scan found ' + list.length);
+    return list;
+  } catch (e) { log('rules:scan error: ' + e.message); return []; }
+});
+ipcMain.handle('rules:import', async (e, sel) => {
+  try {
+    const f = sel && sel.path;
+    if (!f || !fs.existsSync(f)) return { ok: false, msg: '规则文件不存在' };
+    const content = fs.readFileSync(f, 'utf8').slice(0, 12000);
+    const cred = path.join(process.env.USERPROFILE || '', '.dsh', '.credentials.yaml');
+    const key = fs.existsSync(cred) ? String(fs.readFileSync(cred, 'utf8')).match(/sk-[a-zA-Z0-9]+/) : null;
+    if (!key) return { ok: false, msg: '未配置 API Key' };
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key[0] },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: '你是规则精简助手。把外部 AI 工具的规则文件精简改写为通用、适用于 DeepSeek Harness 的规则：剔除该工具专属特性（如 plan!/ponytail/autosolve 等），保留通用行为准则。输出为简洁的 Markdown 规则列表（要点式，200 字内）。' },
+          { role: 'user', content: content },
+        ],
+        max_tokens: 600,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(40000),
+    });
+    const j = await res.json();
+    const text = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+    if (!text) return { ok: false, msg: 'AI 无返回: ' + (j.error ? j.error.message : '') };
+    const target = path.join(process.env.USERPROFILE || '', '.dsh', 'AGENTS.md');
+    const head = '\n\n## 继承自 ' + (sel.name || '外部 AI 工具') + '\n' + text.trim() + '\n';
+    fs.appendFileSync(target, head);
+    log('rules:import wrote to ' + target);
+    return { ok: true, msg: '已写入 ~/.dsh/AGENTS.md（' + (text.length) + ' 字符）' };
+  } catch (err) {
+    return { ok: false, msg: '导入失败: ' + err.message };
+  }
+});
+
+// ==================== GitHub search proxy (for marketplace) ====================
+ipcMain.handle('plugin:search', async (e, { q, sort, page } = {}) => {
+  try {
+    const params = new URLSearchParams({ q: q || 'topic:dsh-plugin', sort: sort || 'stars', order: 'desc', per_page: '20', page: String(page || 1) });
+    const url = 'https://api.github.com/search/repositories?' + params.toString();
+    const res = await fetch(url, { headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'dsh-client' }, signal: AbortSignal.timeout(20000) });
+    if (!res.ok) return { ok: false, msg: 'GitHub API ' + res.status, items: [] };
+    const j = await res.json();
+    const items = (j.items || []).map((r) => ({
+      fullName: r.full_name,
+      desc: r.description || '',
+      stars: r.stargazers_count || 0,
+      updated: r.updated_at || '',
+      lang: r.language || '',
+      htmlUrl: r.html_url,
+    }));
+    return { ok: true, items, total: j.total_count || 0 };
+  } catch (err) { return { ok: false, msg: err.message, items: [], total: 0 }; }
+});
+
+// ==================== smart plugin install (marketplace "一键安装") ====================
+const GIT_MIRRORS = [
+  'https://ghproxy.net/https://github.com/',
+  'https://ghfast.top/https://github.com/',
+  'https://gh-proxy.com/https://github.com/',
+];
+async function restartDSH() {
+  await killByPort(PORT);
+  await ensureServer();
+  if (webView && !webView.webContents.isDestroyed()) webView.webContents.loadURL(URL);
+}
+async function gitCloneMirror(repo, dest) {
+  const url = 'https://github.com/' + repo + '.git';
+  for (const m of GIT_MIRRORS) {
+    try {
+      await execGitTimeout(['clone', '--depth', '1', m + url, dest], 90000);
+      log('git clone OK via ' + m);
+      return true;
+    } catch (e) { log('mirror clone failed ' + m + ': ' + e.message); }
+  }
+  try { await execGitTimeout(['clone', '--depth', '1', url, dest], 120000); log('git clone OK (direct)'); return true; } catch (e) { log('direct clone failed: ' + e.message); }
+  return false;
+}
+ipcMain.handle('plugin:install', async (e, info) => {
+  const pkg = (info && info.pkg) || '';
+  const repo = (info && info.repo) || '';
+  try {
+    // 1) npm route (npmmirror already configured in profile .npmrc)
+    if (pkg) {
+      try {
+        await execCmdLive('cmd.exe', ['/c', 'dsh', 'plugin', '--profile', 'web', 'add', pkg], 20000, () => log('plugin:install npm ' + pkg + ' …'));
+        await restartDSH();
+        return { ok: true, msg: '已通过 npm 安装: ' + pkg };
+      } catch (npmErr) { log('npm install failed: ' + npmErr.message); }
+    }
+    // 2) git route (mirror-first)
+    if (repo) {
+      const name = String(repo.split('/').pop() || '').toLowerCase();
+      const tmp = path.join(app.getPath('temp'), 'mp-install-' + name);
+      fs.rmSync(tmp, { recursive: true, force: true });
+      if (await gitCloneMirror(repo, tmp)) {
+        if (fs.existsSync(path.join(tmp, 'SKILL.md'))) {
+          const dest = path.join(process.env.USERPROFILE || '', '.dsh', 'skills', name);
+          fs.rmSync(dest, { recursive: true, force: true });
+          fs.cpSync(tmp, dest, { recursive: true });
+          await restartDSH();
+          return { ok: true, msg: '已安装 Skill: ' + name + '（~/.dsh/skills/' + name + '）' };
+        }
+        if (fs.existsSync(path.join(tmp, 'package.json'))) {
+          const profile = path.join(DSH_DIR, 'profiles', 'web');
+          await execCmdLive('cmd.exe', ['/c', 'pnpm', 'add', 'file:' + tmp], 20000, () => log('plugin:install pnpm ' + name + ' …'), { cwd: profile });
+          // mount via cordis.patch.yml
+          const patch = path.join(profile, 'cordis.patch.yml');
+          const cur = fs.existsSync(patch) ? fs.readFileSync(patch, 'utf8') : '';
+          if (!cur.includes("name: '" + name + "'") && !cur.includes('name: "' + name + '"')) {
+            const entry = '\n- insert:\n    - id: ' + name + '\n      name: \'' + name + '\'\n';
+            fs.writeFileSync(patch, cur.trimEnd() + entry);
+          }
+          await restartDSH();
+          return { ok: true, msg: '已安装插件: ' + name + '（已挂载 cordis）' };
+        }
+        return { ok: false, msg: '仓库类型无法识别（无 SKILL.md / package.json）' };
+      }
+      return { ok: false, msg: '克隆失败：所有 GitHub 镜像不可达，请检查网络' };
+    }
+    return { ok: false, msg: '缺少安装信息' };
+  } catch (err) {
+    return { ok: false, msg: '安装失败: ' + err.message };
+  }
+});
 // plugin description -> AI explanation via DeepSeek (uses dsh's configured key)
 ipcMain.handle('translate:text', async (e, text) => {
   try {
