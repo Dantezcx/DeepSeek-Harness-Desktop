@@ -301,8 +301,34 @@ function layoutViews() {
   if (barView) barView.setBounds({ x: 0, y: mainH, width: w, height: BAR_H });
 }
 
+// self-heal: remove bundles that lack a dsh.bundle manifest (client-only pkgs
+// like dsh-plugin-marketplace must be mounted via cordis.patch.yml, not bundles)
+function fixProfileBundles() {
+  try {
+    const p = path.join(DSH_DIR, 'profiles', 'web', 'package.json');
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const bundles = (j.dsh && j.dsh.profile && j.dsh.profile.bundles) || [];
+    const bad = bundles.filter((b) => {
+      try {
+        const bp = path.join(DSH_DIR, 'profiles', 'web', 'node_modules', b, 'package.json');
+        if (!fs.existsSync(bp)) return false;
+        const m = JSON.parse(fs.readFileSync(bp, 'utf8'));
+        return !(m.dsh && m.dsh.bundle);
+      } catch (e) { return false; }
+    });
+    if (bad.length) {
+      j.dsh.profile.bundles = bundles.filter((b) => !bad.includes(b));
+      fs.writeFileSync(p, JSON.stringify(j, null, 2));
+      log('fixProfileBundles: removed invalid bundles: ' + bad.join(', '));
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
 // ---- boot ----
 async function bootWeb() {
+  try { if (fixProfileBundles()) log('profile bundles fixed, service will use patched config'); } catch (e) {}
   const status = await ensureServer();
   if (status === 'timeout') {
     let diag = '(无日志)';
