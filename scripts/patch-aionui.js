@@ -1,11 +1,30 @@
 // 为 dsh-web-ui 的右侧面板（aionui-panel）打"概览"标签补丁（幂等）。
 // 用法: node patch-aionui.js
 // 更新 dsh-web-ui 后重新运行即可（若锚点不匹配会明确报错，便于适配新版）。
+// 路径基于 %USERPROFILE% 动态解析（不再硬编码用户名），换机器/用户也能运行。
 const fs = require('fs');
-const P = 'C:/Users/dante/.dsh/profiles/web/node_modules/@linxin666/dsh-client-ui-aionui-panel/lib/client.js';
+const path = require('path');
 
-if (!fs.existsSync(P)) {
-  console.error('[patch] 未找到 aionui-panel client.js: ' + P);
+const USER = process.env.USERPROFILE || process.env.HOME || '';
+const LIXIN_DIR = path.join(USER, '.dsh', 'profiles', 'web', 'node_modules', '@linxin666');
+
+function findClientJs() {
+  if (!fs.existsSync(LIXIN_DIR)) return null;
+  // 首选 aionui-panel 包
+  const primary = path.join(LIXIN_DIR, 'dsh-client-ui-aionui-panel', 'lib', 'client.js');
+  if (fs.existsSync(primary)) return primary;
+  // 兼容包名变化：扫描 @linxin666 下所有含 aionui 的包
+  for (const pkg of fs.readdirSync(LIXIN_DIR)) {
+    if (!/aionui/i.test(pkg)) continue;
+    const cand = path.join(LIXIN_DIR, pkg, 'lib', 'client.js');
+    if (fs.existsSync(cand)) return cand;
+  }
+  return null;
+}
+
+const P = findClientJs();
+if (!P) {
+  console.error('[patch] 未找到 aionui-panel client.js（@linxin666 插件未安装？目录: ' + LIXIN_DIR + '）');
   process.exit(1);
 }
 
@@ -59,4 +78,4 @@ function need(ok, what) { if (!ok) throw new Error('[patch] 锚点未找到: ' +
 }
 
 fs.writeFileSync(P, s);
-console.log('[patch] 补丁应用成功：右侧面板新增"概览"标签');
+console.log('[patch] 补丁应用成功：右侧面板新增"概览"标签 (' + P + ')');

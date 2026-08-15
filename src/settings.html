@@ -36,7 +36,10 @@
 </style>
 </head>
 <body>
-  <h1>DSH 客户端设置</h1>
+  <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px">
+    <h1 style="margin-bottom:0">DSH 客户端设置</h1>
+    <span style="font-size:12px;color:#8b949e">by <span style="color:#58a6ff">喵筱曦</span></span>
+  </div>
 
   <div class="row">
     <input type="checkbox" id="closeToTray" style="flex:none">
@@ -62,6 +65,10 @@
       <label>Git 远程地址</label>
       <input type="text" id="gitRemote" placeholder="https://user:TOKEN@github.com/you/dsh-sync.git 或 ssh://...">
     </div>
+    <div class="row">
+      <button id="testGit" class="secondary">测试连接</button>
+      <span id="gitTestStatus" class="status"></span>
+    </div>
   </div>
 
   <div id="webdavBox" style="display:none">
@@ -77,12 +84,20 @@
       <label>密码</label>
       <input type="password" id="davPass" placeholder="应用密码">
     </div>
+    <div class="row">
+      <button id="testWebdav" class="secondary">测试连接</button>
+      <span id="davTestStatus" class="status"></span>
+    </div>
   </div>
 
   <h2>同步内容</h2>
   <label class="chk"><input type="checkbox" id="cSessions"> 会话记录（sessions/）</label>
   <label class="chk"><input type="checkbox" id="cApi"> API 配置（.credentials.yaml）<small style="display:block;color:#d29922">同步到云端有泄露风险，请确认目标可信</small></label>
   <label class="chk"><input type="checkbox" id="cSettings"> 设置与工作区状态</label>
+
+  <label class="chk" id="ackRow" style="margin-top:10px;padding:9px 11px;border:1px solid #d2992266;border-radius:6px;background:#161b22;color:#d29922">
+    <input type="checkbox" id="syncAck" style="flex:none"> 确认选项：我已确认目标地址可信，知晓会话/API 配置同步到云端存在泄露风险
+  </label>
 
   <div class="row" style="margin-top:8px">
     <input type="checkbox" id="autoSync" style="flex:none">
@@ -114,7 +129,30 @@
       <span id="backupStatus" class="status"></span>
     </div>
     <div id="backupList" style="margin-top:10px"></div>
-    <div class="hint" style="margin-top:8px">备份 = 把会话/API/设置打包成带日期的 tar.gz 直接上传到 WebDAV 根目录（保留最近 10 份）；恢复时按日期选择，会覆盖本地。</div>
+    <div class="hint" style="margin-top:8px">备份 = 把会话/API/设置 + 插件与插件设置（dsh-web-ui 全家桶等）打包成带日期的 tar.gz 直接上传到 WebDAV 根目录（保留最近 10 份）；恢复时按日期选择，会覆盖本地。</div>
+  </div>
+
+  <hr class="sep">
+  <h2>🤝 继承外部 AI 规则</h2>
+  <div class="hint" style="margin-bottom:10px">从其他 AI 工具（Claude Code / Cursor / Gemini / Codex 等）继承行为规则：自动搜索其规则文件 → 精简改写为 dsh 可用规则（自动剔除该软件专属特性）→ 写入长期记忆。仅在你点击确认后才会读取文件。</div>
+  <div class="actions">
+    <button id="rulesScanBtn">搜索规则文件</button>
+    <button id="rulesImportBtn" class="secondary" disabled>导入选中</button>
+    <span id="rulesStatus" class="status"></span>
+  </div>
+  <div id="rulesList" style="margin-top:8px"></div>
+
+  <hr class="sep">
+  <div style="text-align:center;margin-bottom:8px">
+    <button id="restartBtn" class="secondary" style="padding:5px 18px">🔄 重启 dsh 服务</button>
+    <span id="restartStatus" class="status"></span>
+    <div class="hint" style="margin-top:4px">修改插件/补丁后服务未生效时，点此静默重启（不退出客户端）</div>
+  </div>
+
+  <hr class="sep">
+  <div style="text-align:center;color:#6e7681;font-size:11px;line-height:1.8;padding:4px 0 8px">
+    🐋 DSH 客户端 · 作者：<span style="color:#8b949e">喵筱曦</span> · 开源免费使用（MIT）<br>
+    基于 <span style="color:#58a6ff">DeepSeek Harness</span> 生态构建 · 欢迎提出 Issue 与建议
   </div>
 
 <script>
@@ -126,9 +164,14 @@
     const m = cfg.method || 'off';
     $('gitBox').style.display = m === 'git' ? '' : 'none';
     $('webdavBox').style.display = m === 'webdav' ? '' : 'none';
-    $('syncActions').style.display = m === 'git' ? '' : 'none';
-    $('syncHint').style.display = m === 'git' ? '' : 'none';
+    $('syncActions').style.display = m === 'off' ? 'none' : '';
+    $('syncHint').style.display = m === 'off' ? 'none' : '';
+    $('ackRow').style.display = m === 'off' ? 'none' : '';
     $('backupBox').style.display = m === 'webdav' ? '' : 'none';
+    // 「立即同步/从云端恢复」仅 Git 模式（WebDAV 用备份管理替代，避免功能冲突）
+    $('syncBtn').style.display = m === 'git' ? '' : 'none';
+    $('restoreBtn').style.display = m === 'git' ? '' : 'none';
+    refreshHint(m);
     $('gitRemote').value = (cfg.git && cfg.git.remote) || '';
     $('davUrl').value = (cfg.webdav && cfg.webdav.url) || '';
     $('davUser').value = (cfg.webdav && cfg.webdav.user) || '';
@@ -136,19 +179,30 @@
     $('cSessions').checked = !!(cfg.content && cfg.content.sessions);
     $('cApi').checked = !!(cfg.content && cfg.content.api);
     $('cSettings').checked = !!(cfg.content && cfg.content.settings);
+    $('syncAck').checked = !!cfg.ack;
     $('autoSync').checked = !!cfg.auto;
     $('syncInterval').value = cfg.intervalMin || 30;
     $('status').textContent = cfg.lastStatus ? ('上次：' + new Date(cfg.lastSync).toLocaleString('zh-CN', { hour12: false }) + ' — ' + cfg.lastStatus) : '';
     $('status').className = 'status' + (cfg.lastStatus && /成功|完成/.test(cfg.lastStatus) ? ' ok' : ' err');
   }
 
+  function refreshHint(m) {
+    $('syncHint').innerHTML = m === 'git'
+      ? '说明：Git 方式用「立即同步」推送/拉取，「从云端恢复」回滚到云端最新。'
+      : '说明：WebDAV 方式用「创建备份并上传」打包快照（会话/API/设置 + 插件与插件设置，云端保留最近 10 份），在备份列表按日期恢复，会覆盖本地。<br>WebDAV 密码以明文保存在本地配置（%APPDATA%\\dsh-client\\config.json），请知悉。';
+  }
+
   $('syncMethod').onchange = () => {
     const m = $('syncMethod').value;
     $('gitBox').style.display = m === 'git' ? '' : 'none';
     $('webdavBox').style.display = m === 'webdav' ? '' : 'none';
-    $('syncActions').style.display = m === 'git' ? '' : 'none';
-    $('syncHint').style.display = m === 'git' ? '' : 'none';
+    $('syncActions').style.display = m === 'off' ? 'none' : '';
+    $('syncHint').style.display = m === 'off' ? 'none' : '';
+    $('ackRow').style.display = m === 'off' ? 'none' : '';
     $('backupBox').style.display = m === 'webdav' ? '' : 'none';
+    $('syncBtn').style.display = m === 'git' ? '' : 'none';
+    $('restoreBtn').style.display = m === 'git' ? '' : 'none';
+    refreshHint(m);
   };
 
   $('save').onclick = async () => {
@@ -162,6 +216,13 @@
     cfg.content = { sessions: $('cSessions').checked, api: $('cApi').checked, settings: $('cSettings').checked };
     cfg.auto = $('autoSync').checked;
     cfg.intervalMin = parseInt($('syncInterval').value, 10) || 30;
+    cfg.ack = $('syncAck').checked;
+    if (cfg.method !== 'off' && !cfg.ack) {
+      $('status').textContent = '✗ 请先勾选「确认选项」：我已确认目标地址可信，知晓同步到云端存在泄露风险';
+      $('status').className = 'status err';
+      $('syncAck').focus();
+      return;
+    }
     const saved = await window.api.saveSyncConfig(cfg);
     $('status').textContent = '设置已保存';
     $('status').className = 'status ok';
@@ -194,6 +255,26 @@
     const c2 = await window.api.getSyncConfig();
     if (c2) { cfg = c2; apply(); }
   };
+
+  // ---- connection test (uses current form values, no need to save first) ----
+  async function testConnection(kind) {
+    const btn = kind === 'git' ? $('testGit') : $('testWebdav');
+    const st  = kind === 'git' ? $('gitTestStatus') : $('davTestStatus');
+    btn.disabled = true;
+    st.textContent = '测试中…';
+    st.className = 'status';
+    const p = {
+      method: kind,
+      git: { remote: $('gitRemote').value.trim() },
+      webdav: { url: $('davUrl').value.trim(), user: $('davUser').value.trim(), pass: $('davPass').value },
+    };
+    const r = await window.api.testSync(p);
+    st.textContent = (r.ok ? '✓ ' : '✗ ') + r.msg;
+    st.className = 'status ' + (r.ok ? 'ok' : 'err');
+    btn.disabled = false;
+  }
+  $('testGit').onclick = () => testConnection('git');
+  $('testWebdav').onclick = () => testConnection('webdav');
 
   // ---- backup management ----
   const bList = $('backupList');
@@ -233,7 +314,63 @@
     if (r.ok) renderBackups(r.items);
     else { $('backupStatus').textContent = '✗ ' + r.msg; $('backupStatus').className = 'status err'; }
   };
-  window.api.backupList().then((r) => { if (r.ok) renderBackups(r.items); });
+  window.api.backupList().then((r) => {
+    if (r.ok) renderBackups(r.items);
+    else {
+      $('backupStatus').textContent = '✗ ' + (r.msg || 'WebDAV 未配置');
+      $('backupStatus').className = 'status err';
+    }
+  });
+
+  // ---- 继承外部 AI 规则 ----
+  const rList = $('rulesList');
+  let selectedRule = null;
+  $('rulesScanBtn').onclick = async () => {
+    $('rulesScanBtn').disabled = true;
+    $('rulesStatus').textContent = '搜索中…';
+    $('rulesStatus').className = 'status';
+    const list = await window.api.rulesScan();
+    $('rulesScanBtn').disabled = false;
+    if (!list.length) {
+      rList.innerHTML = '<div style="color:#8b949e;font-size:12px">未找到规则文件（已扫描 Claude Code / Cursor / Gemini / Codex / Copilot 常见位置）</div>';
+      $('rulesStatus').textContent = '';
+      $('rulesImportBtn').disabled = true;
+      return;
+    }
+    rList.innerHTML = list.map((f, i) => `
+      <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid #21262d;border-radius:6px;margin-bottom:6px;background:#161b22;font-size:12px;cursor:pointer">
+        <input type="radio" name="ruleSel" value="${i}" style="accent-color:#58a6ff">
+        <span style="flex:1;color:#e6edf3">${String(f.name).replace(/</g, '&lt;')}</span>
+        <span style="color:#6e7681;flex:none">${(f.size / 1024).toFixed(1)}KB</span>
+      </label>`).join('');
+    rList.querySelectorAll('input[name=ruleSel]').forEach((el) => {
+      el.onchange = () => { selectedRule = list[parseInt(el.value, 10)]; $('rulesImportBtn').disabled = false; };
+    });
+    $('rulesStatus').textContent = '找到 ' + list.length + ' 个规则文件，选择后点「导入选中」';
+    $('rulesStatus').className = 'status';
+  };
+  $('rulesImportBtn').onclick = async () => {
+    if (!selectedRule) return;
+    if (!confirm('将读取并精简以下文件，追加写入 dsh 长期记忆（~/.dsh/AGENTS.md）：\n' + selectedRule.name + '\n\n继续？')) return;
+    $('rulesImportBtn').disabled = true;
+    $('rulesStatus').textContent = '读取并精简中（调用 AI 改写，可能需要一会儿）…';
+    $('rulesStatus').className = 'status';
+    const r = await window.api.rulesImport({ name: selectedRule.name, path: selectedRule.path });
+    $('rulesStatus').textContent = (r.ok ? '✅ ' : '✗ ') + r.msg;
+    $('rulesStatus').className = 'status ' + (r.ok ? 'ok' : 'err');
+    $('rulesImportBtn').disabled = false;
+  };
+
+  // ---- 重启服务 ----
+  $('restartBtn').onclick = async () => {
+    $('restartBtn').disabled = true;
+    $('restartStatus').textContent = '重启中…';
+    $('restartStatus').className = 'status';
+    const r = await window.api.restartService();
+    $('restartStatus').textContent = r.ok ? '✅ ' + r.msg : '✗ ' + r.msg;
+    $('restartStatus').className = 'status ' + (r.ok ? 'ok' : 'err');
+    $('restartBtn').disabled = false;
+  };
 
   window.api.getSyncConfig().then(c => { if (c) { cfg = c; } apply(); });
   window.api.getConfig().then(c => { if (c) $('closeToTray').checked = !!c.closeToTray; });

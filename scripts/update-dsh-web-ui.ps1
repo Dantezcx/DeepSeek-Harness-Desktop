@@ -1,6 +1,17 @@
 $ErrorActionPreference = 'Continue'
 $here = $PSScriptRoot
 
+Write-Host '[update] 0/5 检查 pnpm（dsh 插件系统依赖）...' -ForegroundColor Cyan
+if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
+    Write-Host '[update] 未找到 pnpm，正在通过 npm 全局安装...' -ForegroundColor Yellow
+    & npm install -g pnpm
+    if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
+        Write-Host '[update] ERROR: pnpm 安装失败，请手动执行: npm install -g pnpm' -ForegroundColor Red
+        exit 1
+    }
+}
+Write-Host '[update] pnpm 就绪: ' + (pnpm --version) -ForegroundColor Green
+
 Write-Host '[update] 1/5 停止 dsh 服务（释放文件占用）...' -ForegroundColor Cyan
 if (Test-Path "$here\stop.ps1") { powershell -NoProfile -ExecutionPolicy Bypass -File "$here\stop.ps1" | Out-Host }
 

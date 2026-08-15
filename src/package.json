@@ -1,6 +1,6 @@
 {
   "name": "dsh-client",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DSH desktop client (built-in UI, no browser)",
   "main": "main.js",
   "scripts": {
@@ -13,6 +13,7 @@
   "build": {
     "appId": "com.dante.dsh-client",
     "productName": "DSH客户端",
+    "npmRebuild": false,
     "files": [
       "main.js",
       "loading.html",
@@ -36,7 +37,7 @@
           ]
         }
       ],
-      "artifactName": "install-dsh-v1.0.0.exe",
+      "artifactName": "install-dsh-v1.1.0.exe",
       "icon": "icon.ico"
     },
     "nsis": {

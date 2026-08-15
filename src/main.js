@@ -235,6 +235,338 @@ async function setupInstall() {
   return checkEnv();
 }
 
+// ==================== dsh-web-ui integration (idempotent) ====================
+// `dsh plugin` is a thin pnpm forwarder, so a missing pnpm silently breaks
+// plugin installs (the packaged installer used to finish without dsh-web-ui).
+// This block ensures pnpm, installs the default plugin set and applies the
+// "概览" overview-tab patch on every boot; all steps are idempotent and
+// non-blocking on failure. Install-on-first-run = "安装即使用".
+const WEB_UI_PKGS = [
+  '@linxin666/dsh-web-ui-all',   // 皮肤/右侧面板/任务看板/宠物 全家桶
+  'dsh-plugin-marketplace',      // 设置页内置插件市场（浏览/搜索/一键安装社区插件）
+  'dsh-chat-import',             // 六大工具历史对话导入
+];
+const WEB_NM_DIR = path.join(process.env.USERPROFILE || '', '.dsh', 'profiles', 'web', 'node_modules');
+
+function pluginInstalled(pkg) {
+  try {
+    if (pkg.startsWith('@')) {
+      const scope = pkg.split('/')[0];
+      const dir = path.join(WEB_NM_DIR, scope);
+      return fs.existsSync(dir) && fs.readdirSync(dir).length > 0;
+    }
+    return fs.existsSync(path.join(WEB_NM_DIR, pkg));
+  } catch (e) { return false; }
+}
+
+function pnpmCmdPath() {
+  const cands = [
+    path.join(process.env.APPDATA || '', 'npm', 'pnpm.cmd'),
+    path.join(NODE_DIR, 'pnpm.cmd'),
+  ];
+  return cands.find((p) => fs.existsSync(p)) || null;
+}
+function ensureNpmBinOnPath() {
+  // npm global bin dir may not be on this process' PATH (e.g. fresh install);
+  // child processes inherit process.env, so inject it once.
+  const npmBin = path.join(process.env.APPDATA || '', 'npm');
+  if (npmBin && !String(process.env.PATH || '').split(path.delimiter).includes(npmBin)) {
+    process.env.PATH = npmBin + path.delimiter + (process.env.PATH || '');
+    log('ensurePnpm: added npm global bin to PATH: ' + npmBin);
+  }
+}
+async function ensurePnpm() {
+  // 1) known full paths (no PATH dependency)
+  const direct = pnpmCmdPath();
+  if (direct) {
+    try { await execCmd('cmd.exe', ['/c', direct, '--version']); return true; } catch (e) {}
+  }
+  // 2) on PATH
+  try { await execCmd('cmd.exe', ['/c', 'pnpm', '--version']); return true; } catch (e) {}
+  // 3) install via npm -g, then use the resolved full path
+  try {
+    const npm = fs.existsSync(NPM_CMD) ? NPM_CMD : 'npm';
+    log('ensurePnpm: installing pnpm globally via npm...');
+    await execCmd('cmd.exe', ['/c', npm, 'install', '-g', 'pnpm']);
+    ensureNpmBinOnPath();
+    const after = pnpmCmdPath();
+    if (after) { await execCmd('cmd.exe', ['/c', after, '--version']); return true; }
+    await execCmd('cmd.exe', ['/c', 'pnpm', '--version']);
+    return true;
+  } catch (e) {
+    log('ensurePnpm npm path failed: ' + e.message);
+  }
+  // 4) corepack (bundled with Node)
+  try {
+    const corepack = path.join(NODE_DIR, 'corepack.cmd');
+    if (fs.existsSync(corepack)) {
+      log('ensurePnpm: enabling pnpm via corepack...');
+      await execCmd('cmd.exe', ['/c', corepack, 'enable', 'pnpm']);
+      const after = path.join(NODE_DIR, 'pnpm.cmd');
+      if (fs.existsSync(after)) { await execCmd('cmd.exe', ['/c', after, '--version']); return true; }
+    }
+  } catch (e) {
+    log('ensurePnpm corepack path failed: ' + e.message);
+  }
+  return false;
+}
+
+function applyOverviewPatch() {
+  const target = path.join(LIXIN_DIR, 'dsh-client-ui-aionui-panel', 'lib', 'client.js');
+  if (!fs.existsSync(target)) {
+    log('[patch] aionui-panel client.js not found: ' + target);
+    return { ok: false, msg: 'aionui-panel client.js 未找到' };
+  }
+  let s = fs.readFileSync(target, 'utf8');
+  if (s.includes('explorer.tabs.overview') || s.includes('dsh-overview-host')) {
+    log('[patch] already applied (idempotent)');
+    return { ok: true, msg: '已应用（幂等跳过）' };
+  }
+  const need = (ok, what) => { if (!ok) throw new Error('[patch] 锚点未找到: ' + what); };
+  // 1) zh locale
+  {
+    const anchor = '"explorer.tabs.files": "文件",';
+    need(s.includes(anchor), 'zh locale');
+    s = s.replace(anchor, anchor + '\n\t\t\t"explorer.tabs.overview": "概览",');
+  }
+  // 2) en locale
+  {
+    const anchor = '"explorer.tabs.files": "Files",';
+    need(s.includes(anchor), 'en locale');
+    s = s.replace(anchor, anchor + '\n\t\t\t"explorer.tabs.overview": "Overview",');
+  }
+  // 3) tab bar: insert overview button after the changes tab button
+  {
+    const needle = 'children: t("explorer.tabs.changes")';
+    const i = s.indexOf(needle);
+    need(i >= 0, 'changes tab button');
+    const closeNeedle = '}),';
+    const j = s.indexOf(closeNeedle, i);
+    need(j >= 0, 'changes tab button close');
+    const indent = s.slice(0, j).split('\n').pop().match(/^\s*/)[0];
+    const btn =
+      '\n' + indent + '/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {' +
+      '\n' + indent + '\ttype: "button",' +
+      '\n' + indent + '\tclassName: state.activeTab === "overview" ? explorer_module_css_default.tabBtnActive : explorer_module_css_default.tabBtn,' +
+      '\n' + indent + '\tonClick: () => stores.explorer.setActiveTab("overview"),' +
+      '\n' + indent + '\tchildren: t("explorer.tabs.overview")' +
+      '\n' + indent + '}),';
+    s = s.slice(0, j + closeNeedle.length) + btn + s.slice(j + closeNeedle.length);
+  }
+  // 4) content area: overview host container after ScmPanel conditional
+  {
+    const anchor = 'state.activeTab === "changes" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ScmPanel, { stores })';
+    const i = s.indexOf(anchor);
+    need(i >= 0, 'ScmPanel conditional');
+    const tail = ', state.activeTab === "overview" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", { id: "dsh-overview-host", style: { flex: 1, minHeight: 0, overflowY: "auto" } })';
+    s = s.slice(0, i + anchor.length) + tail + s.slice(i + anchor.length);
+  }
+  fs.writeFileSync(target, s);
+  log('[patch] overview tab patch applied');
+  return { ok: true, msg: '概览标签补丁已应用' };
+}
+
+// 给 dsh-plugin-marketplace 的详情面板 README 摘要加「🌐 翻译为中文」按钮：
+// 点击后经 window.api.translateText（main 进程代理 Google 翻译，无 CORS 限制）
+// 翻译摘要，结果直接写入 DOM（不依赖 React state）。幂等。
+function applyMarketplaceTranslatePatch() {
+  const target = path.join(WEB_NM_DIR, 'dsh-plugin-marketplace', 'client.js');
+  if (!fs.existsSync(target)) {
+    log('[mp-patch] marketplace client.js not found');
+    return { ok: false, changed: false, msg: 'client.js 未找到' };
+  }
+  let s = fs.readFileSync(target, 'utf8');
+  if (s.includes('__mp_translateBtn') || s.includes('translateText')) {
+    log('[mp-patch] already applied (idempotent)');
+    return { ok: true, changed: false, msg: '已应用（幂等跳过）' };
+  }
+  const anchor = [
+    '            : props.readmeError ? props.t("readmeEmpty")',
+    '            : (props.readme || "")',
+    '        )',
+    '      );',
+  ].join('\n');
+  const i = s.indexOf(anchor);
+  if (i < 0) {
+    log('[mp-patch] 锚点未找到，跳过（插件版本可能已更新）');
+    return { ok: false, changed: false, msg: '锚点未找到' };
+  }
+  const btn = [
+    '            : props.readmeError ? props.t("readmeEmpty")',
+    '            : (props.readme || "")',
+    '        ),',
+    '        h("div", { className: "__mp_translateRow" },',
+    '          h("button", { type: "button", className: "__mp_translateBtn",',
+    '            style: { marginTop: "8px", padding: "4px 10px", fontSize: "12px", cursor: "pointer", background: "var(--dsw-alias-bg-hover, #21262d)", color: "var(--dsw-alias-label-primary, #e6edf3)", border: "1px solid var(--dsw-alias-border, #30363d)", borderRadius: "6px" },',
+    '            onClick: function(ev) {',
+    '              var btn = ev.currentTarget;',
+    '              var out = document.getElementById("__mp_translateOut");',
+    '              if (!out || !window.api || !window.api.translateText) return;',
+    '              btn.disabled = true;',
+    '              out.textContent = "翻译中…";',
+    '              window.api.translateText(props.readme || "").then(function(t) {',
+    '                out.textContent = t || "（翻译失败，请检查网络）";',
+    '                btn.style.display = "none";',
+    '              }).catch(function() { out.textContent = "（翻译失败，请检查网络）"; btn.disabled = false; });',
+    '            }',
+    '          }, "🌐 翻译为中文"),',
+    '          h("div", { id: "__mp_translateOut", style: { fontSize: "12px", lineHeight: "1.6", color: "var(--dsw-alias-label-secondary, #8b949e)", whiteSpace: "pre-wrap", wordBreak: "break-word", marginTop: "8px", borderTop: "1px solid var(--dsw-alias-border, #21262d)", paddingTop: "8px" } }, "")',
+    '        )',
+    '      );',
+  ].join('\n');
+  s = s.slice(0, i) + btn + s.slice(i + anchor.length);
+  fs.writeFileSync(target, s);
+  log('[mp-patch] marketplace 翻译补丁已应用');
+  return { ok: true, changed: true, msg: '翻译补丁已应用' };
+}
+
+async function ensureWebUI() {
+  try {
+    const missing = WEB_UI_PKGS.filter((p) => !pluginInstalled(p));
+    if (missing.length) {
+      if (!(await ensurePnpm())) return { ok: false, installed: false, msg: 'pnpm 不可用，无法安装插件' };
+      const bin = dshBinPath();
+      const nodeExe = fs.existsSync(NODE_EXE) ? NODE_EXE : 'node';
+      for (const pkg of missing) {
+        log('ensureWebUI: installing ' + pkg + ' (this may take a while)...');
+        if (bin) {
+          try {
+            await execCmd(nodeExe, [bin, 'plugin', '--profile', 'web', 'add', pkg]);
+          } catch (e) {
+            // pnpm may exit non-zero (e.g. ERR_PNPM_IGNORED_BUILDS) even though
+            // every package was installed — continue to the installed-check below
+            log('ensureWebUI: ' + pkg + ' add exited non-zero (may still be installed): ' + e.message);
+          }
+        } else {
+          await execCmd('cmd.exe', ['/c', DSH_CMD, 'plugin', '--profile', 'web', 'add', pkg])
+            .catch((e) => log('ensureWebUI: ' + pkg + ' add (cmd) exited non-zero: ' + e.message));
+        }
+      }
+      const stillMissing = WEB_UI_PKGS.filter((p) => !pluginInstalled(p));
+      if (stillMissing.length) return { ok: false, installed: false, msg: '部分插件未装齐: ' + stillMissing.join(', ') };
+    } else {
+      log('ensureWebUI: all plugins already installed');
+    }
+    // pnpm exits non-zero (ERR_PNPM_IGNORED_BUILDS) on this profile, so dsh's
+    // own reconcile (registering packages into dsh.profile.bundles) never runs;
+    // make sure every installed plugin is registered, otherwise dsh won't load it.
+    // registerBundle only accepts packages with a dsh.bundle manifest; client-only
+    // plugins (e.g. dsh-plugin-marketplace) are wired up via cordis.patch.yml.
+    let registered = false;
+    for (const pkg of WEB_UI_PKGS) {
+      if (pluginInstalled(pkg) && registerBundle(pkg)) registered = true;
+    }
+    if (ensureMarketplacePatch()) registered = true;
+    // 自愈：无论谁把无 dsh.bundle 的纯客户端插件写进了 bundles（例如 dsh 自己的
+    // reconcile 在 pnpm 退出码为 0 时会把新装插件一律注册进 bundles），启动时
+    // 移除它们——dsh 对 bundles 强制校验 dsh.bundle，误注册会导致服务崩溃
+    // （历史事故：dsh-plugin-marketplace 曾导致 "dsh web 启动超时"）。
+    if (pruneInvalidBundles()) registered = true;
+    if (registered) log('ensureWebUI: bundles updated, service restart needed');
+    const patch = applyOverviewPatch();
+    // marketplace 详情面板中文翻译补丁（幂等；变更后需要重启服务加载）
+    if (pluginInstalled('dsh-plugin-marketplace')) {
+      const mp = applyMarketplaceTranslatePatch();
+      if (mp.changed) { registered = true; log('ensureWebUI: marketplace translate patch applied, restart needed'); }
+    }
+    log('ensureWebUI done: installed=' + (missing.length > 0) + ' registered=' + registered + ' patch=' + patch.msg);
+    return { ok: patch.ok, installed: missing.length > 0 || registered, msg: patch.msg };
+  } catch (e) {
+    log('ensureWebUI error: ' + e.message);
+    return { ok: false, installed: false, msg: e.message };
+  }
+}
+
+// 检查某插件是否声明了 dsh.bundle 清单。dsh 启动时会把 bundles 里的每个
+// 包当作 profile bundle 加载并强制要求 dsh.bundle 字段，缺失会直接抛错
+// （如 dsh-plugin-marketplace 曾被误注册导致 dsh web 崩溃、客户端启动超时）。
+// 纯客户端插件（只有 dsh.client）必须走 cordis.patch.yml，不能进 bundles。
+function hasBundleManifest(pkg) {
+  try {
+    const p = path.join(WEB_NM_DIR, pkg.split('/').join(path.sep), 'package.json');
+    if (!fs.existsSync(p)) return false;
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return !!(j.dsh && j.dsh.bundle);
+  } catch (e) { return false; }
+}
+
+// 把已安装的 dsh 插件登记进 profiles/web/package.json 的 dsh.profile.bundles
+// （幂等：已在列表则不动；仅登记声明了 dsh.bundle 的包；返回是否发生了变更）
+function registerBundle(pkg) {
+  try {
+    if (!hasBundleManifest(pkg)) {
+      log('ensureWebUI: skip registering ' + pkg + ' (no dsh.bundle manifest, client-only via patch)')
+      return false;
+    }
+    const pj = path.join(WEB_NM_DIR, '..', 'package.json');
+    if (!fs.existsSync(pj)) return false;
+    const j = JSON.parse(fs.readFileSync(pj, 'utf8'));
+    j.dsh = j.dsh || {};
+    j.dsh.profile = j.dsh.profile || {};
+    const bundles = j.dsh.profile.bundles || [];
+    if (bundles.includes(pkg)) return false;
+    bundles.push(pkg);
+    j.dsh.profile.bundles = bundles;
+    fs.writeFileSync(pj, JSON.stringify(j, null, 2));
+    log('ensureWebUI: registered bundle ' + pkg);
+    return true;
+  } catch (e) {
+    log('registerBundle ' + pkg + ' error: ' + e.message);
+    return false;
+  }
+}
+
+// dsh-plugin-marketplace 是纯客户端插件（package.json 只有 dsh.client，无
+// dsh.bundle），按它的 README 通过 profiles/web/cordis.patch.yml 的 insert
+// 条目加载，而不是进 bundles。幂等：已有条目则不动。
+function ensureMarketplacePatch() {
+  try {
+    const f = path.join(WEB_NM_DIR, '..', 'cordis.patch.yml');
+    if (!fs.existsSync(f)) return false;
+    let s = fs.readFileSync(f, 'utf8');
+    if (s.includes('plugin-marketplace')) return false;
+    const entry = '- insert:\n    - id: plugin-marketplace\n      name: dsh-plugin-marketplace\n';
+    const trimmed = s.trim();
+    s = (trimmed === '[]' || trimmed === '')
+      ? entry
+      : (trimmed.endsWith('\n') ? trimmed : trimmed + '\n') + '\n' + entry;
+    fs.writeFileSync(f, s);
+    log('ensureWebUI: cordis.patch.yml insert plugin-marketplace');
+    return true;
+  } catch (e) {
+    log('ensureMarketplacePatch error: ' + e.message);
+    return false;
+  }
+}
+
+// 自愈清理：从 dsh.profile.bundles 移除"物理存在但未声明 dsh.bundle"的包。
+// 无法读取/不在 node_modules 的包（如 dsh 内置的 base/web-app）一律保守保留。
+// 幂等：无变化返回 false。
+function pruneInvalidBundles() {
+  try {
+    const pj = path.join(WEB_NM_DIR, '..', 'package.json');
+    if (!fs.existsSync(pj)) return false;
+    const j = JSON.parse(fs.readFileSync(pj, 'utf8'));
+    const bundles = (j.dsh && j.dsh.profile && j.dsh.profile.bundles) || [];
+    const kept = bundles.filter((pkg) => {
+      try {
+        const p = path.join(WEB_NM_DIR, pkg, 'package.json');
+        if (!fs.existsSync(p)) return true; // 非物理包（dsh 内置）→ 保留
+        const j2 = JSON.parse(fs.readFileSync(p, 'utf8'));
+        return !!(j2.dsh && j2.dsh.bundle);
+      } catch (e) { return true; } // 无法判断 → 保守保留
+    });
+    if (kept.length === bundles.length) return false;
+    j.dsh.profile.bundles = kept;
+    fs.writeFileSync(pj, JSON.stringify(j, null, 2));
+    log('ensureWebUI: pruned invalid bundles: ' + bundles.filter((p) => !kept.includes(p)).join(', '));
+    return true;
+  } catch (e) {
+    log('pruneInvalidBundles error: ' + e.message);
+    return false;
+  }
+}
+
 // ---- quit ----
 async function quitApp() {
   forceQuit = true;
@@ -270,6 +602,17 @@ function createTray() {
     { label: '显示窗口', click: () => { if (win) { win.show(); win.focus(); } } },
     { label: '设置', click: showSettings },
     { type: 'separator' },
+    {
+      label: '关于',
+      click: () => dialog.showMessageBox(win, {
+        type: 'info',
+        title: '关于 DSH 客户端',
+        message: '🐋 DSH 客户端',
+        detail: '作者：喵筱曦\n开源免费使用（MIT）\n基于 DeepSeek Harness 生态构建，内置 dsh-web-ui 全家桶 / 插件市场 / 云端快照备份。',
+        buttons: ['好的'],
+      }),
+    },
+    { type: 'separator' },
     { label: '退出（停止服务）', click: quitApp },
   ]));
   tray.on('double-click', () => { if (win) { win.show(); win.focus(); } });
@@ -287,7 +630,15 @@ function layoutViews() {
 
 // ---- boot ----
 async function bootWeb() {
-  const status = await ensureServer();
+  const ui = await ensureWebUI();
+  let status = await ensureServer();
+  if (ui.installed && status === 'already') {
+    // plugin was just installed while a service was already running;
+    // restart it so dsh-web-ui is actually loaded
+    log('bootWeb: web-ui freshly installed, restarting running service');
+    await killByPort(PORT);
+    status = await ensureServer();
+  }
   if (status === 'timeout') {
     let diag = '(无日志)';
     try {
@@ -405,6 +756,137 @@ ipcMain.on('stats:from-web', (e, s) => {
 ipcMain.on('debug:log', (e, msg) => log('web: ' + msg));
 ipcMain.handle('ui:settings', () => showSettings());
 ipcMain.handle('ui:quit', () => quitApp());
+// 插件介绍中文翻译（main 进程代理 Google 翻译，无浏览器 CORS 限制）
+ipcMain.handle('translate:text', async (e, text) => {
+  try {
+    let t = String(text || '').trim();
+    if (!t) return '';
+    if (t.length > 1500) t = t.slice(0, 1500);
+    const res = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=' + encodeURIComponent(t), {
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    return (j[0] || []).map((x) => x[0] || '').join('');
+  } catch (e) {
+    log('translate error: ' + e.message);
+    return '';
+  }
+});
+
+// ==================== 继承外部 AI 规则（Claude Code / Cursor / Gemini 等） ====================
+const RULE_CANDIDATES = [
+  { name: 'Claude Code — ~/.claude/CLAUDE.md', path: path.join(process.env.USERPROFILE || '', '.claude', 'CLAUDE.md') },
+  { name: 'Claude Code — ~/.claude/AGENTS.md', path: path.join(process.env.USERPROFILE || '', '.claude', 'AGENTS.md') },
+  { name: 'Cursor — ~/.cursorrules', path: path.join(process.env.USERPROFILE || '', '.cursorrules') },
+  { name: 'Copilot — ~/.copilot-instructions.md', path: path.join(process.env.USERPROFILE || '', '.copilot-instructions.md') },
+  { name: 'Gemini — ~/.gemini/instructions.md', path: path.join(process.env.USERPROFILE || '', '.gemini', 'instructions.md') },
+  { name: 'Codex — ~/.codex/AGENTS.md', path: path.join(process.env.USERPROFILE || '', '.codex', 'AGENTS.md') },
+];
+// 剔除的软件特性关键词（这些行/段落不属于 dsh 通用行为）
+const TOOL_SPECIFIC = /plan!|ponytail|autosolve|sessionend|session end|hook|技能清单|快捷键|@-mention|@mention|\/compact|mcp|permission mode|build mode|autocommit|schedule agent/i;
+
+function scanRuleFiles() {
+  const found = [];
+  for (const c of RULE_CANDIDATES) {
+    try {
+      if (fs.existsSync(c.path)) {
+        const st = fs.statSync(c.path);
+        if (st.size > 0 && st.size < 512 * 1024) found.push({ name: c.name, path: c.path, size: st.size });
+      }
+    } catch (e) {}
+  }
+  // Cursor rules 目录
+  try {
+    const dir = path.join(process.env.USERPROFILE || '', '.cursor', 'rules');
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.mdc'))) {
+        const p = path.join(dir, f);
+        const st = fs.statSync(p);
+        if (st.size < 512 * 1024) found.push({ name: 'Cursor — rules/' + f, path: p, size: st.size });
+      }
+    }
+  } catch (e) {}
+  return found;
+}
+
+async function llmRewriteRules(text, sourceName) {
+  const key = (() => {
+    try {
+      const cred = path.join(process.env.USERPROFILE || '', '.dsh', '.credentials.yaml');
+      if (!fs.existsSync(cred)) return null;
+      return String(fs.readFileSync(cred, 'utf8')).match(/sk-[a-zA-Z0-9]+/)?.[0] || null;
+    } catch (e) { return null; }
+  })();
+  const sys = [
+    '你是 AI 助手规则精简专家。用户会给你一份其他 AI 工具（如 Claude Code / Cursor / Gemini）的规则文件原文。',
+    '请执行：1) 剔除该工具专属特性（plan! 指令、ponytail、autosolve、会话钩子、技能清单、快捷键、@-mention、/compact、MCP 等）；',
+    '2) 保留通用行为约定（语言偏好、编码原则、文件/扫描权限、先出思路后执行、中文备注、输出标注、凭证安全等）；',
+    '3) 输出精简后的简体中文 Markdown，开头标题为「### 继承自 ' + sourceName + ' 的规则」，条目式，不含任何账号/密码/路径等敏感信息。',
+  ].join(' ');
+  try {
+    if (!key) return { ok: false, msg: '未找到 API 密钥（~/.dsh/.credentials.yaml），无法智能精简' };
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: String(text).slice(0, 20000) },
+        ],
+        max_tokens: 1500,
+        temperature: 0.3,
+      }),
+      signal: AbortSignal.timeout(90000),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    const out = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content || '').trim();
+    if (!out) throw new Error('空响应');
+    return { ok: true, content: out };
+  } catch (e) {
+    log('llmRewriteRules error: ' + e.message);
+    // 降级：启发式过滤
+    const kept = String(text).split('\n').filter((l) => !TOOL_SPECIFIC.test(l)).join('\n').trim();
+    return { ok: true, content: '### 继承自 ' + sourceName + ' 的规则（启发式精简）\n\n' + kept.slice(0, 4000), degraded: true };
+  }
+}
+
+async function importRulesFile(name, filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return { ok: false, msg: '文件不存在' };
+    const text = fs.readFileSync(filePath, 'utf8');
+    if (!text.trim()) return { ok: false, msg: '文件为空' };
+    const r = await llmRewriteRules(text, name);
+    if (!r.ok) return r;
+    const agents = path.join(process.env.USERPROFILE || '', '.dsh', 'AGENTS.md');
+    const stamp = '\n\n### 继承的外部规则（导入于 ' + new Date().toLocaleString('zh-CN', { hour12: false }) + '，来源：' + name + '）\n' + r.content + '\n';
+    fs.appendFileSync(agents, stamp);
+    log('rules import: ' + name + ' -> ' + agents);
+    return { ok: true, msg: '已导入并精简为 dsh 规则' + (r.degraded ? '（API 不可用，使用启发式精简）' : '') };
+  } catch (e) {
+    log('importRulesFile error: ' + e.message);
+    return { ok: false, msg: e.message };
+  }
+}
+ipcMain.handle('rules:scan', () => scanRuleFiles());
+ipcMain.handle('rules:import', (e, f) => importRulesFile(f.name, f.path));
+
+// 静默重启 dsh web 服务（编译/改插件后强制生效）
+ipcMain.handle('service:restart', async () => {
+  try {
+    log('service:restart requested');
+    await killByPort(PORT);
+    const status = await ensureServer();
+    if (webView && !webView.webContents.isDestroyed()) webView.webContents.loadURL(URL);
+    const ok = status !== 'timeout';
+    return { ok, msg: ok ? '服务已重启' : '服务重启超时（' + status + '）' };
+  } catch (e) {
+    log('service:restart error: ' + e.message);
+    return { ok: false, msg: '重启失败: ' + e.message };
+  }
+});
 
 // ==================== sync (git / webdav) ====================
 const DSH_DIR = path.join(process.env.USERPROFILE || '', '.dsh');
@@ -419,6 +901,21 @@ function syncSelectedPaths() {
   if (c.sessions) paths.push('sessions');
   if (c.api) paths.push('.credentials.yaml');
   if (c.settings) paths.push('settings.yaml', 'pet.json', '.anonymous-user-id', 'storages', 'profiles/web/cordis.patch.yml', 'profiles/web/cordis.yml', 'profiles/web/package.json');
+  return paths;
+}
+// tar.gz 快照备份：在逐文件同步内容之外，额外打包插件本体与其配置
+// （dsh-web-ui 全家桶 @linxin666、pnpm 依赖锁定文件），恢复后开箱即用
+function backupPaths() {
+  const c = (config.sync && config.sync.content) || {};
+  const paths = [];
+  if (c.sessions) paths.push('sessions');
+  if (c.api) paths.push('.credentials.yaml');
+  if (c.settings) paths.push(
+    'settings.yaml', 'pet.json', '.anonymous-user-id', 'storages',
+    'profiles/web/cordis.patch.yml', 'profiles/web/cordis.yml',
+    'profiles/web/package.json', 'profiles/web/pnpm-workspace.yaml', 'profiles/web/pnpm-lock.yaml',
+    'profiles/web/node_modules/@linxin666'
+  );
   return paths;
 }
 function execGit(args, cwd) {
@@ -460,35 +957,49 @@ async function gitSync() {
 
 // ---- WebDAV (https + PROPFIND/PUT/GET) ----
 function davFetch(method, url, { body, headers, timeout = 20000 } = {}) {
+  // encode non-ASCII chars (e.g. Chinese path segments) without touching existing %XX
+  url = url.replace(/[^\x00-\x7F]/g, (c) => encodeURIComponent(c));
   return fetch(url, { method, body, headers, signal: AbortSignal.timeout(timeout) });
 }
 function davAuth(user, pass) {
   return 'Basic ' + Buffer.from(user + ':' + pass).toString('base64');
 }
 async function davMkcol(url, auth) {
-  try { await davFetch('MKCOL', url, { headers: { Authorization: auth } }); } catch (e) {}
+  const res = await davFetch('MKCOL', url, { headers: { Authorization: auth } });
+  // 201 created / 405 already exists / any 2xx are fine; everything else is an error
+  if (res.status !== 201 && res.status !== 405 && !(res.status >= 200 && res.status < 300)) {
+    throw new Error('MKCOL ' + res.status);
+  }
 }
 async function davList(url, auth) {
   // PROPFIND depth:1 -> [{path, url, lastModified(ms)}]
   const res = await davFetch('PROPFIND', url, { headers: { Authorization: auth, Depth: '1' } });
   if (!res.ok) throw new Error('PROPFIND ' + res.status);
   const xml = await res.text();
-  const origin = new globalThis.URL(url).origin;
-  const items = [];
+  // Resolve hrefs against the *request* URL (with trailing slash) so that
+  // relative ("child/"), root-relative ("/share/folder/...") and absolute
+  // hrefs all map to the correct full URL. Synology returns root-relative
+  // paths that the old origin+h join would misplace.
+  const baseUrl = /\/$/.test(url) ? url : url + '/';
   const hrefRe = /<[A-Za-z0-9_-]+:href>([^<]+)<\/[A-Za-z0-9_-]+:href>/g;
   const lmRe = /<[A-Za-z0-9_-]+:getlastmodified>([^<]+)<\/[A-Za-z0-9_-]+:getlastmodified>/g;
   const szRe = /<[A-Za-z0-9_-]+:getcontentlength>([^<]+)<\/[A-Za-z0-9_-]+:getcontentlength>/g;
   let m;
-  while ((m = hrefRe.exec(xml))) items.push({ href: m[1], lastModified: null, size: null });
+  const out = [];
+  while ((m = hrefRe.exec(xml))) {
+    const h = m[1];
+    let full;
+    try { full = new globalThis.URL(h, baseUrl).href; }
+    catch (e) { full = baseUrl + h; }
+    out.push({ path: decodeURIComponent(h), url: full, lastModified: null, size: null });
+  }
   const lms = [];
   while ((m = lmRe.exec(xml))) lms.push(Date.parse(m[1]));
   const sizes = [];
   while ((m = szRe.exec(xml))) sizes.push(parseInt(m[1], 10) || null);
-  const out = [];
-  items.forEach((it, i) => {
-    const h = it.href;
-    const full = /^https?:\/\//i.test(h) ? h : origin + h;
-    out.push({ path: decodeURIComponent(h), url: full, lastModified: lms[i] || null, size: sizes[i] || null });
+  out.forEach((it, i) => {
+    it.lastModified = lms[i] || null;
+    it.size = sizes[i] || null;
   });
   return out;
 }
@@ -509,9 +1020,22 @@ async function davListRecursive(url, auth) {
   }
   return out;
 }
-// extract relative path under the sync root from a DAV href
-function relFromDavPath(p) {
-  return decodeURIComponent(p).replace(/\/+$/, '').replace(/^\/+/, '').replace(/^dsh-sync\/?/, '');
+// extract relative path under the sync root from a full DAV url
+function relFromDavUrl(fullUrl, root) {
+  let p = String(fullUrl || '');
+  let r = String(root || '').replace(/\/+$/, '');
+  // normalize both sides through URL so percent-encoding matches
+  // (e.g. 中文 path segments get %XX-encoded by new URL())
+  try { p = new globalThis.URL(p).href; } catch (e) {}
+  try { r = new globalThis.URL(r).href; } catch (e) {}
+  r = r.replace(/\/+$/, '') + '/';
+  if (p.startsWith(r)) {
+    p = p.slice(r.length);
+  } else {
+    // href not under our sync root; fall back to the URL pathname
+    try { p = new globalThis.URL(p).pathname.replace(/^\/+/, ''); } catch (e) {}
+  }
+  return decodeURIComponent(p.replace(/\/+$/, ''));
 }
 async function davGet(url, auth) {
   const res = await davFetch('GET', url, { headers: { Authorization: auth } });
@@ -575,11 +1099,15 @@ async function webdavSync() {
   const files = collectSyncFiles();
   for (const f of files) {
     try {
-      await ensureDir(f.rel.includes('/') ? f.rel.slice(0, f.rel.lastIndexOf('/')) : '');
+      const parent = f.rel.includes('/') ? f.rel.slice(0, f.rel.lastIndexOf('/')) : '';
+      await ensureDir(parent);
       const buf = fs.readFileSync(f.local);
       const url = root + '/' + f.rel;
-      const remoteLast = await davList(root + '/' + f.rel.slice(0, f.rel.lastIndexOf('/')), auth).catch(() => []);
-      const item = remoteLast.find((x) => decodeURIComponent(x.path).endsWith('/' + f.rel));
+      const remoteLast = await davList(parent ? root + '/' + parent : root, auth).catch(() => []);
+      const item = remoteLast.find((x) => {
+        const p = decodeURIComponent(x.path);
+        return p === f.rel || p.endsWith('/' + f.rel);
+      });
       if (!item || !item.lastModified || fs.statSync(f.local).mtimeMs > item.lastModified) {
         await davPut(url, buf, auth);
       }
@@ -588,10 +1116,12 @@ async function webdavSync() {
     }
   }
   try {
-    const remote = await davList(root + '/sessions', auth).catch(() => []);
+    // sessions are nested (sessions/<workspace>/<id>/session.jsonl.zstd),
+    // so a depth-1 listing would only return workspace dirs -> recurse
+    const remote = await davListRecursive(root + '/sessions', auth).catch(() => []);
     for (const item of remote) {
-      const rel = relFromDavPath(item.path);
-      if (!rel || item.path.endsWith('/')) continue;
+      const rel = relFromDavUrl(item.url, root); // e.g. 'sessions/<ws>/<id>/session.jsonl.zstd'
+      if (!rel || rel === 'sessions' || !rel.startsWith('sessions/')) continue;
       const local = path.join(DSH_DIR, rel.split('/').join(path.sep));
       if (!fs.existsSync(local) || (item.lastModified && item.lastModified > fs.statSync(local).mtimeMs)) {
         try {
@@ -609,8 +1139,51 @@ async function webdavSync() {
   return { ok: true, msg: 'WebDAV 同步完成' };
 }
 
+// ---- connection test (settings UI: "测试连接") ----
+async function webdavTest(w) {
+  const base = (w.url || '').trim().replace(/\/+$/, '');
+  if (!base || !w.user || !w.pass) return { ok: false, msg: 'WebDAV 配置不完整（地址/用户名/密码）' };
+  const auth = davAuth(w.user, w.pass);
+  const t0 = Date.now();
+  try {
+    const res = await davFetch('PROPFIND', base, { headers: { Authorization: auth, Depth: '0' } });
+    const ok2xx = res.status >= 200 && res.status < 300;
+    if (!ok2xx && res.status !== 207) {
+      if (res.status === 401 || res.status === 403) return { ok: false, msg: '认证失败（HTTP ' + res.status + '）：请检查用户名/密码' };
+      if (res.status === 404) return { ok: false, msg: '目标路径不存在（HTTP 404）：请检查 WebDAV 地址' };
+      if (res.status === 405) return { ok: false, msg: '目标不支持 WebDAV（HTTP 405）：请检查地址或父目录权限' };
+      return { ok: false, msg: '连接失败（HTTP ' + res.status + '）' };
+    }
+    // verify the backup root is creatable/accessible (405 = already exists = OK)
+    for (const sub of ['dsh-sync', 'dsh-sync/sessions']) {
+      try {
+        await davMkcol(base + '/' + sub, auth);
+      } catch (e) {
+        return { ok: false, msg: '目录创建失败（' + sub + '）：' + e.message + '，请检查写权限' };
+      }
+    }
+    return { ok: true, msg: '连接成功（' + (Date.now() - t0) + 'ms），目录可读写' };
+  } catch (e) {
+    return { ok: false, msg: '无法连接：' + (e && e.message ? e.message : String(e)) };
+  }
+}
+async function gitTest(g) {
+  const remote = (g.remote || '').trim();
+  if (!remote) return { ok: false, msg: '未配置 Git 远程地址' };
+  const t0 = Date.now();
+  try {
+    await execGit(['ls-remote', '--exit-code', remote, 'HEAD'], DSH_DIR);
+    return { ok: true, msg: '连接成功（' + (Date.now() - t0) + 'ms），远程仓库可访问' };
+  } catch (e) {
+    return { ok: false, msg: '无法访问远程仓库：' + (e && e.message ? e.message : String(e)) };
+  }
+}
+
 async function syncNow() {
   const s = config.sync || {};
+  if (s.method && s.method !== 'off' && !s.ack) {
+    return { ok: false, msg: '请先在「设置 → 同步设置」勾选确认选项（知晓同步到云端存在泄露风险）' };
+  }
   const t0 = Date.now();
   let result;
   try {
@@ -639,7 +1212,7 @@ async function webdavRestore() {
   let restored = 0;
   const errors = [];
   for (const it of items) {
-    const rel = relFromDavPath(it.path);
+    const rel = relFromDavUrl(it.url, root);
     if (!rel) continue;
     const local = path.join(DSH_DIR, rel.split('/').join(path.sep));
     try {
@@ -659,6 +1232,9 @@ async function gitRestore() {
 }
 async function restoreNow() {
   const s = config.sync || {};
+  if (s.method && s.method !== 'off' && !s.ack) {
+    return { ok: false, msg: '请先在「设置 → 同步设置」勾选确认选项（知晓同步到云端存在泄露风险）' };
+  }
   let result;
   try {
     if (s.method === 'git') result = await gitRestore();
@@ -673,20 +1249,32 @@ async function restoreNow() {
   log('restore result: ' + result.msg);
   return result;
 }
+let autoSyncDelay = null, autoSyncLoop = null;
 function scheduleAutoSync() {
+  if (autoSyncDelay) { clearTimeout(autoSyncDelay); autoSyncDelay = null; }
+  if (autoSyncLoop) { clearInterval(autoSyncLoop); autoSyncLoop = null; }
   const s = config.sync || {};
   if (!s.auto) return;
   const mins = Math.max(1, Number(s.intervalMin) || 30);
-  setTimeout(() => {
+  autoSyncDelay = setTimeout(() => {
+    autoSyncDelay = null;
     syncNow();
-    setInterval(syncNow, mins * 60000);
+    autoSyncLoop = setInterval(syncNow, mins * 60000);
   }, 60000);
+  log('auto sync scheduled: interval ' + mins + 'min');
 }
 ipcMain.handle('sync:get-config', () => (config.sync || {}));
 ipcMain.handle('sync:save-config', (e, sc) => {
   config.sync = sc;
   saveConfig();
+  scheduleAutoSync();
   return config.sync;
+});
+ipcMain.handle('sync:test', (e, p) => {
+  const p2 = p || {};
+  if (p2.method === 'git') return gitTest(p2.git || {});
+  if (p2.method === 'webdav') return webdavTest(p2.webdav || {});
+  return { ok: false, msg: '请先选择同步方式（Git 或 WebDAV）' };
 });
 ipcMain.handle('sync:now', () => syncNow());
 ipcMain.handle('sync:restore', () => restoreNow());
@@ -725,12 +1313,16 @@ function tsStamp() {
 }
 async function backupCreate() {
   if ((config.sync || {}).method === 'git') return syncNow();
+  const s = config.sync || {};
+  if (s.method && s.method !== 'off' && !s.ack) {
+    return { ok: false, msg: '请先在「设置 → 同步设置」勾选确认选项（知晓同步到云端存在泄露风险）' };
+  }
   const dv = davBackupRoot();
   if (!dv) return { ok: false, msg: 'WebDAV 未配置（请先在同步设置中填写地址/账号）' };
   const name = 'dsh-backup-' + tsStamp() + '.tar.gz';
   const tmp = path.join(app.getPath('temp'), name);
   try {
-    const paths = syncSelectedPaths();
+    const paths = backupPaths();
     await execTar(['-czf', tmp, '-C', DSH_DIR, ...paths]);
     await davMkcol(dv.base, dv.auth);
     await davPut(dv.base + '/' + name, fs.readFileSync(tmp), dv.auth);
