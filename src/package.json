@@ -1,6 +1,6 @@
 {
   "name": "dsh-client",
-  "version": "1.1.9",
+  "version": "1.1.10",
   "description": "DSH desktop client (built-in UI, no browser)",
   "main": "main.js",
   "scripts": {
@@ -37,7 +37,7 @@
           ]
         }
       ],
-      "artifactName": "install-dsh-v1.1.9.exe",
+      "artifactName": "install-dsh-v1.1.10.exe",
       "icon": "icon.ico"
     },
     "nsis": {

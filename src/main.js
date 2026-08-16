@@ -520,13 +520,13 @@ async function doUpdate() {
     if (!chk.ok) return chk;
     if (!chk.hasUpdate) return { ok: false, msg: '已是最新版本 ' + APP_VERSION };
     const exeName = 'install-dsh-v' + chk.latest + '.exe';
-    const path = 'https://github.com/' + UPDATE_REPO + '/releases/download/v' + chk.latest + '/' + exeName;
+    const url = 'https://github.com/' + UPDATE_REPO + '/releases/download/v' + chk.latest + '/' + exeName;
     const tmp = path.join(app.getPath('temp'), 'dsh-update-' + chk.latest + '.exe');
     // 下载：直连 + GitHub 镜像兜底（国内网络）
     let saved = false;
     for (const m of ['https://ghproxy.net/', 'https://ghfast.top/', 'https://gh-proxy.com/', '']) {
       try {
-        const res = await fetch(m + path, { signal: AbortSignal.timeout(600000), redirect: 'follow' });
+        const res = await fetch(m + url, { signal: AbortSignal.timeout(600000), redirect: 'follow' });
         if (!res.ok) { log('update download ' + (m || '直连') + ' HTTP ' + res.status); continue; }
         const buf = Buffer.from(await res.arrayBuffer());
         fs.writeFileSync(tmp, buf);
