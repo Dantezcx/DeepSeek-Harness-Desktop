@@ -45,10 +45,14 @@
   </span>
   <span class="spacer"></span>
   <button id="settings">设置</button>
+  <button id="update" title="检查更新">更新</button>
   <button id="quit" class="danger">退出</button>
+  <span class="sep"></span>
+  <span class="seg"><span class="lb">v</span><span class="vl" id="ver">—</span></span>
   <span id="time"></span>
 <script>
   const $ = id => document.getElementById(id);
+  let updating = false;
   async function refresh() {
     try {
       const s = await window.statusApi.getStatus();
@@ -62,6 +66,7 @@
       $('thisCost').textContent = s.thisCost;
       $('sessCost').textContent = s.sessCost;
       $('balance').textContent = s.balance;
+      $('ver').textContent = s.version || '—';
     } catch (e) {
       document.body.className = 'offline';
       $('svc').textContent = 'DSH 离线';
@@ -72,6 +77,23 @@
   setInterval(() => { $('time').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false }); }, 1000);
   $('settings').onclick = () => window.statusApi.openSettings();
   $('quit').onclick = () => window.statusApi.quit();
+  $('update').onclick = async () => {
+    if (updating) return;
+    try {
+      const r = await window.statusApi.checkUpdate();
+      if (!r.ok) { alert('❌ ' + r.msg); return; }
+      if (!r.hasUpdate) { alert('✅ 已是最新版本 v' + r.current); return; }
+      if (!confirm('发现新版本 v' + r.latest + '（当前 v' + r.current + '）\n\n更新内容：\n' + (r.notes || '（无说明）').slice(0, 300) + '\n\n将静默下载并安装，客户端会自动退出，安装完成后重新打开即可。\n继续？')) return;
+      updating = true;
+      $('update').disabled = true;
+      $('update').textContent = '更新中…';
+      const u = await window.statusApi.doUpdate();
+      if (!u.ok) { alert('❌ ' + u.msg); updating = false; $('update').disabled = false; $('update').textContent = '更新'; }
+    } catch (e) {
+      alert('❌ 更新失败: ' + (e && e.message ? e.message : e));
+      updating = false; $('update').disabled = false; $('update').textContent = '更新';
+    }
+  };
 </script>
 </body>
 </html>

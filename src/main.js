@@ -5,6 +5,9 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = 8123;
+const APP_VERSION = (() => {
+  try { return require('./package.json').version; } catch (e) { return '1.1.8'; }
+})();
 const URL  = `http://127.0.0.1:${PORT}`;
 const BAR_H = 30;
 let win = null;
@@ -38,7 +41,7 @@ function log(msg) {
 let webStats = {};
 let lastModel = null;
 let maxInTokens = 0, maxOutTokens = 0;
-let sessionCost = 0;
+let lastCost = 0, lastDeltaCost = 0;
 let balance = null, balanceAt = 0;
 let envCache = null, envCacheAt = 0;
 const PRICING = { // CNY per 1M tokens (DeepSeek official)
@@ -52,9 +55,15 @@ function pricingFor(model) {
 function calcCost(s) {
   const p = pricingFor(s.model);
   const inTok = Number(s.inTokens) || 0;
-  const hit = Number(s.cacheHits) || 0;
+  const hit = Number(s.cacheHits);
   const out = Number(s.outTokens) || 0;
-  return ((inTok - hit) * p.in + hit * p.inHit + out * p.out) / 1e6;
+  if (hit == null || isNaN(hit)) {
+    // 页面未提供缓存命中数：长会话上下文大多命中缓存（¥0.5/1M），
+    // 按命中价估算更贴近真实账单，避免按全价（¥2/1M）虚高 4 倍
+    return (inTok * p.inHit + out * p.out) / 1e6;
+  }
+  const hitN = Math.max(0, Math.min(hit, inTok));
+  return ((inTok - hitN) * p.in + hitN * p.inHit + out * p.out) / 1e6;
 }
 function fmtMoney(v) {
   if (v == null || isNaN(v)) return '—';
@@ -451,15 +460,14 @@ ipcMain.handle('status:get', async () => {
   const outTok = Number(webStats.outTokens) || 0;
   if (inTok > maxInTokens) maxInTokens = inTok;
   if (outTok > maxOutTokens) maxOutTokens = outTok;
-  const thisCost = calcCost(webStats);
-  sessionCost = Math.max(sessionCost, thisCost);
+  const thisCost = calcCost(webStats); // 当前快照的会话累计费用
   return {
-    online, port: PORT, workspace, sessions, mode: 'web',
+    online, port: PORT, workspace, sessions, mode: 'web', version: APP_VERSION,
     model: webStats.model || lastModel || '未配置',
-    sessTokens: fmtNum(maxInTokens + maxOutTokens),
+    sessTokens: fmtNum(inTok + outTok),       // 当前累计 tokens（不再分别取最大再相加）
     thisTokens: fmtNum(outTok),
-    thisCost: fmtMoney(thisCost),
-    sessCost: fmtMoney(sessionCost),
+    thisCost: fmtMoney(Math.max(0, lastDeltaCost)), // 本次增量费用（stats 推进基线）
+    sessCost: fmtMoney(thisCost),             // 会话累计费用（不再取历史峰值）
     balance: bal != null ? '¥' + bal : '—',
   };
 });
@@ -470,12 +478,77 @@ ipcMain.on('stats:from-web', (e, s) => {
     const inTok = Number(s.inTokens) || 0, outTok = Number(s.outTokens) || 0;
     if (inTok > maxInTokens) maxInTokens = inTok;
     if (outTok > maxOutTokens) maxOutTokens = outTok;
-    sessionCost = Math.max(sessionCost, calcCost(s));
+    // 费用基线：页面累计值只增不减，增量 = 本次费用
+    const c = calcCost(s);
+    if (c > 0 && c >= lastCost) { lastDeltaCost = c - lastCost; lastCost = c; }
   }
 });
 ipcMain.on('debug:log', (e, msg) => log('web: ' + msg));
 ipcMain.handle('ui:settings', () => showSettings());
 ipcMain.handle('ui:quit', () => quitApp());
+
+// ==================== 静默更新（GitHub Releases） ====================
+const UPDATE_REPO = 'Dantezcx/DeepSeek-Harness-Desktop';
+function compareVersions(a, b) {
+  const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x !== y) return x - y;
+  }
+  return 0;
+}
+async function checkUpdate() {
+  try {
+    const res = await fetch('https://api.github.com/repos/' + UPDATE_REPO + '/releases/latest', {
+      headers: { 'User-Agent': 'dsh-client', Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    const latest = String(j.tag_name || '').replace(/^v/i, '');
+    const hasUpdate = compareVersions(latest, APP_VERSION) > 0;
+    log('checkUpdate: current=' + APP_VERSION + ' latest=' + latest + ' has=' + hasUpdate);
+    return { ok: true, hasUpdate, current: APP_VERSION, latest, url: j.html_url, notes: String(j.body || '').slice(0, 600) };
+  } catch (e) {
+    log('checkUpdate error: ' + e.message);
+    return { ok: false, msg: '检查更新失败: ' + e.message };
+  }
+}
+async function doUpdate() {
+  try {
+    const chk = await checkUpdate();
+    if (!chk.ok) return chk;
+    if (!chk.hasUpdate) return { ok: false, msg: '已是最新版本 ' + APP_VERSION };
+    const exeName = 'install-dsh-v' + chk.latest + '.exe';
+    const path = 'https://github.com/' + UPDATE_REPO + '/releases/download/v' + chk.latest + '/' + exeName;
+    const tmp = path.join(app.getPath('temp'), 'dsh-update-' + chk.latest + '.exe');
+    // 下载：直连 + GitHub 镜像兜底（国内网络）
+    let saved = false;
+    for (const m of ['https://ghproxy.net/', 'https://ghfast.top/', 'https://gh-proxy.com/', '']) {
+      try {
+        const res = await fetch(m + path, { signal: AbortSignal.timeout(600000), redirect: 'follow' });
+        if (!res.ok) { log('update download ' + (m || '直连') + ' HTTP ' + res.status); continue; }
+        const buf = Buffer.from(await res.arrayBuffer());
+        fs.writeFileSync(tmp, buf);
+        saved = true;
+        log('update downloaded via ' + (m || '直连') + ' ' + Math.round(buf.length / 1024 / 1024) + 'MB');
+        break;
+      } catch (e) { log('update download ' + (m || '直连') + ' failed: ' + e.message); }
+    }
+    if (!saved) return { ok: false, msg: '下载安装包失败（网络受限），请稍后重试或手动下载' };
+    // 静默安装（NSIS /S），短暂延迟后退出客户端，安装器完成覆盖；重开即新版
+    const c = spawn(tmp, ['/S'], { detached: true, stdio: 'ignore' });
+    c.on('error', (e) => log('update spawn error: ' + e.message));
+    c.unref();
+    setTimeout(() => { quitApp(); }, 1500);
+    return { ok: true, msg: '更新已开始（' + APP_VERSION + ' → ' + chk.latest + '），客户端将自动退出，安装完成后重新打开即可使用' };
+  } catch (e) {
+    log('doUpdate error: ' + e.message);
+    return { ok: false, msg: '更新失败: ' + e.message };
+  }
+}
+ipcMain.handle('update:check', () => checkUpdate());
+ipcMain.handle('update:do', () => doUpdate());
 
 // ==================== sync (git / webdav) ====================
 const DSH_DIR = path.join(process.env.USERPROFILE || '', '.dsh');
@@ -1029,7 +1102,8 @@ ipcMain.handle('sync:test', async (e, p) => {
     const pass = (p && p.webdav && p.webdav.pass) || '';
     if (!url || !user || !pass) return { ok: false, msg: 'WebDAV 配置不完整（地址/用户名/密码）' };
     const auth = davAuth(user, pass);
-    const res = await davFetch('PROPFIND', url + '/', { headers: { Authorization: auth, Depth: '0' }, timeout: 15000 });
+    // 8s 短超时：服务器不可达时尽快返回错误，避免长时间卡在「测试中」
+    const res = await davFetch('PROPFIND', url + '/', { headers: { Authorization: auth, Depth: '0' }, timeout: 8000 });
     if (res.ok) return { ok: true, msg: 'WebDAV 连接成功（HTTP ' + res.status + '）' };
     return { ok: false, msg: 'WebDAV 连接失败（HTTP ' + res.status + '，检查地址/认证/目录权限）' };
   } catch (e) {
@@ -1119,9 +1193,10 @@ async function backupList() {
   const dv = davBackupRoot();
   if (!dv) return { ok: false, items: [], msg: 'WebDAV 未配置' };
   try {
+    // 服务器不可达/认证失败时如实报错，而不是伪装成"暂无备份"
     const items = await davList(dv.base, dv.auth).catch((e) => {
       log('backupList davList error: ' + e.message);
-      return [];
+      throw e;
     });
     log('backupList raw: ' + items.length + ' items: ' + JSON.stringify(items.map((x) => x.path)));
     const list = items
