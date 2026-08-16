@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('api', {
   rulesImport: (sel) => ipcRenderer.invoke('rules:import', sel),
   searchPlugins: (params) => ipcRenderer.invoke('plugin:search', params),
   getReadme: (fullName) => ipcRenderer.invoke('plugin:readme', fullName),
+  restartService: () => ipcRenderer.invoke('service:restart'),
 });
 
 // ============ overview injection (dsh-web-ui "概览" tab) ============

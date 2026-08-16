@@ -492,6 +492,21 @@ function syncSelectedPaths() {
   if (c.settings) paths.push('settings.yaml', 'pet.json', '.anonymous-user-id', 'storages', 'profiles/web/cordis.patch.yml', 'profiles/web/cordis.yml', 'profiles/web/package.json');
   return paths;
 }
+// tar.gz 快照备份：在逐文件同步内容之外，额外打包插件本体与其配置
+// （dsh-web-ui 全家桶 @linxin666、pnpm 依赖锁定文件），恢复后开箱即用
+function backupPaths() {
+  const c = (config.sync && config.sync.content) || {};
+  const paths = [];
+  if (c.sessions) paths.push('sessions');
+  if (c.api) paths.push('.credentials.yaml');
+  if (c.settings) paths.push(
+    'settings.yaml', 'pet.json', '.anonymous-user-id', 'storages',
+    'profiles/web/cordis.patch.yml', 'profiles/web/cordis.yml',
+    'profiles/web/package.json', 'profiles/web/pnpm-workspace.yaml', 'profiles/web/pnpm-lock.yaml',
+    'profiles/web/node_modules/@linxin666'
+  );
+  return paths;
+}
 function execGit(args, cwd) {
   return new Promise((resolve, reject) => {
     const c = spawn('git', args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -531,35 +546,46 @@ async function gitSync() {
 
 // ---- WebDAV (https + PROPFIND/PUT/GET) ----
 function davFetch(method, url, { body, headers, timeout = 20000 } = {}) {
+  // 编码非 ASCII 字符（如中文路径段），不破坏已有 %XX
+  url = url.replace(/[^\x00-\x7F]/g, (c) => encodeURIComponent(c));
   return fetch(url, { method, body, headers, signal: AbortSignal.timeout(timeout) });
 }
 function davAuth(user, pass) {
   return 'Basic ' + Buffer.from(user + ':' + pass).toString('base64');
 }
-async function davMkcol(url, auth) {
-  try { await davFetch('MKCOL', url, { headers: { Authorization: auth } }); } catch (e) {}
+async function davMkcol(url, auth, timeout = 20000) {
+  const res = await davFetch('MKCOL', url, { headers: { Authorization: auth }, timeout });
+  // 201 created / 405 already exists / any 2xx are fine; everything else is an error
+  if (res.status !== 201 && res.status !== 405 && !(res.status >= 200 && res.status < 300)) {
+    throw new Error('MKCOL ' + res.status);
+  }
 }
 async function davList(url, auth) {
   // PROPFIND depth:1 -> [{path, url, lastModified(ms)}]
   const res = await davFetch('PROPFIND', url, { headers: { Authorization: auth, Depth: '1' } });
   if (!res.ok) throw new Error('PROPFIND ' + res.status);
   const xml = await res.text();
-  const origin = new globalThis.URL(url).origin;
-  const items = [];
+  // 以请求 URL（补尾斜杠）为基准解析 href，兼容相对/根相对/绝对三种形式
+  //（Synology 返回根相对路径，origin+h 拼接会错位）
+  const baseUrl = /\/$/.test(url) ? url : url + '/';
   const hrefRe = /<[A-Za-z0-9_-]+:href>([^<]+)<\/[A-Za-z0-9_-]+:href>/g;
   const lmRe = /<[A-Za-z0-9_-]+:getlastmodified>([^<]+)<\/[A-Za-z0-9_-]+:getlastmodified>/g;
   const szRe = /<[A-Za-z0-9_-]+:getcontentlength>([^<]+)<\/[A-Za-z0-9_-]+:getcontentlength>/g;
   let m;
-  while ((m = hrefRe.exec(xml))) items.push({ href: m[1], lastModified: null, size: null });
+  const out = [];
+  while ((m = hrefRe.exec(xml))) {
+    const h = m[1];
+    let full;
+    try { full = new globalThis.URL(h, baseUrl).href; } catch (e) { full = baseUrl + h; }
+    out.push({ path: decodeURIComponent(h), url: full, lastModified: null, size: null });
+  }
   const lms = [];
   while ((m = lmRe.exec(xml))) lms.push(Date.parse(m[1]));
   const sizes = [];
   while ((m = szRe.exec(xml))) sizes.push(parseInt(m[1], 10) || null);
-  const out = [];
-  items.forEach((it, i) => {
-    const h = it.href;
-    const full = /^https?:\/\//i.test(h) ? h : origin + h;
-    out.push({ path: decodeURIComponent(h), url: full, lastModified: lms[i] || null, size: sizes[i] || null });
+  out.forEach((it, i) => {
+    it.lastModified = lms[i] || null;
+    it.size = sizes[i] || null;
   });
   return out;
 }
@@ -580,9 +606,20 @@ async function davListRecursive(url, auth) {
   }
   return out;
 }
-// extract relative path under the sync root from a DAV href
-function relFromDavPath(p) {
-  return decodeURIComponent(p).replace(/\/+$/, '').replace(/^\/+/, '').replace(/^dsh-sync\/?/, '');
+// extract relative path under the sync root from a full DAV url
+//（两端统一走 URL 规范化，兼容中文路径被 %XX 编码后与 root 前缀匹配）
+function relFromDavUrl(fullUrl, root) {
+  let p = String(fullUrl || '');
+  let r = String(root || '').replace(/\/+$/, '');
+  try { p = new globalThis.URL(p).href; } catch (e) {}
+  try { r = new globalThis.URL(r).href; } catch (e) {}
+  r = r.replace(/\/+$/, '') + '/';
+  if (p.startsWith(r)) {
+    p = p.slice(r.length);
+  } else {
+    try { p = new globalThis.URL(p).pathname.replace(/^\/+/, ''); } catch (e) {}
+  }
+  return decodeURIComponent(p.replace(/\/+$/, ''));
 }
 async function davGet(url, auth) {
   const res = await davFetch('GET', url, { headers: { Authorization: auth } });
@@ -646,11 +683,15 @@ async function webdavSync() {
   const files = collectSyncFiles();
   for (const f of files) {
     try {
-      await ensureDir(f.rel.includes('/') ? f.rel.slice(0, f.rel.lastIndexOf('/')) : '');
+      const parent = f.rel.includes('/') ? f.rel.slice(0, f.rel.lastIndexOf('/')) : '';
+      await ensureDir(parent);
       const buf = fs.readFileSync(f.local);
       const url = root + '/' + f.rel;
-      const remoteLast = await davList(root + '/' + f.rel.slice(0, f.rel.lastIndexOf('/')), auth).catch(() => []);
-      const item = remoteLast.find((x) => decodeURIComponent(x.path).endsWith('/' + f.rel));
+      const remoteLast = await davList(parent ? root + '/' + parent : root, auth).catch(() => []);
+      const item = remoteLast.find((x) => {
+        const p = decodeURIComponent(x.path);
+        return p === f.rel || p.endsWith('/' + f.rel);
+      });
       if (!item || !item.lastModified || fs.statSync(f.local).mtimeMs > item.lastModified) {
         await davPut(url, buf, auth);
       }
@@ -659,10 +700,11 @@ async function webdavSync() {
     }
   }
   try {
-    const remote = await davList(root + '/sessions', auth).catch(() => []);
+    // 会话为多级目录（sessions/<工作区>/<会话ID>/...），depth-1 只列一层 → 递归拉取
+    const remote = await davListRecursive(root + '/sessions', auth).catch(() => []);
     for (const item of remote) {
-      const rel = relFromDavPath(item.path);
-      if (!rel || item.path.endsWith('/')) continue;
+      const rel = relFromDavUrl(item.url, root); // e.g. 'sessions/<ws>/<id>/session.jsonl.zstd'
+      if (!rel || rel === 'sessions' || !rel.startsWith('sessions/')) continue;
       const local = path.join(DSH_DIR, rel.split('/').join(path.sep));
       if (!fs.existsSync(local) || (item.lastModified && item.lastModified > fs.statSync(local).mtimeMs)) {
         try {
@@ -710,7 +752,7 @@ async function webdavRestore() {
   let restored = 0;
   const errors = [];
   for (const it of items) {
-    const rel = relFromDavPath(it.path);
+    const rel = relFromDavUrl(it.url, root);
     if (!rel) continue;
     const local = path.join(DSH_DIR, rel.split('/').join(path.sep));
     try {
@@ -994,6 +1036,17 @@ ipcMain.handle('sync:test', async (e, p) => {
     return { ok: false, msg: '连接失败: ' + e.message };
   }
 });
+// 静默重启 dsh web 服务（改插件/补丁后强制生效）
+ipcMain.handle('service:restart', async () => {
+  try {
+    log('service:restart requested');
+    await restartDSH();
+    return { ok: true, msg: '服务已重启' };
+  } catch (e) {
+    log('service:restart error: ' + e.message);
+    return { ok: false, msg: '重启失败: ' + e.message };
+  }
+});
 function execGitTimeout(args, timeoutMs) {
   return new Promise((resolve, reject) => {
     const c = spawn('git', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -1045,7 +1098,7 @@ async function backupCreate() {
   const name = 'dsh-backup-' + tsStamp() + '.tar.gz';
   const tmp = path.join(app.getPath('temp'), name);
   try {
-    const paths = syncSelectedPaths();
+    const paths = backupPaths();
     await execTar(['-czf', tmp, '-C', DSH_DIR, ...paths]);
     await davMkcol(dv.base, dv.auth);
     await davPut(dv.base + '/' + name, fs.readFileSync(tmp), dv.auth);
