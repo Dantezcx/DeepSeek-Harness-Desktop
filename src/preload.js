@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('api', {
   getSyncConfig: () => ipcRenderer.invoke('sync:get-config'),
   saveSyncConfig: (sc) => ipcRenderer.invoke('sync:save-config', sc),
   syncNow: () => ipcRenderer.invoke('sync:now'),
+  testSync: (params) => ipcRenderer.invoke('sync:test', params),
   restoreSync: () => ipcRenderer.invoke('sync:restore'),
   backupCreate: () => ipcRenderer.invoke('backup:create'),
   backupList: () => ipcRenderer.invoke('backup:list'),

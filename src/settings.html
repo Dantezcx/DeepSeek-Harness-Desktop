@@ -282,9 +282,14 @@
       git: { remote: $('gitRemote').value.trim() },
       webdav: { url: $('davUrl').value.trim(), user: $('davUser').value.trim(), pass: $('davPass').value },
     };
-    const r = await window.api.testSync(p);
-    st.textContent = (r.ok ? '✓ ' : '✗ ') + r.msg;
-    st.className = 'status ' + (r.ok ? 'ok' : 'err');
+    try {
+      const r = await window.api.testSync(p);
+      st.textContent = (r.ok ? '✓ ' : '✗ ') + r.msg;
+      st.className = 'status ' + (r.ok ? 'ok' : 'err');
+    } catch (err) {
+      st.textContent = '✗ 测试失败: ' + (err && err.message ? err.message : err);
+      st.className = 'status err';
+    }
     btn.disabled = false;
   }
   $('testGit').onclick = () => testConnection('git');
