@@ -570,50 +570,138 @@ async function checkUpdate() {
     return { ok: false, msg: '检查更新失败: ' + e.message };
   }
 }
-// Node 直连下载：不走 Electron/系统代理（避免 Clash fake-ip 拦截 GitHub）。
-// 返回 {ok, size, err}；带超时与进度回调（比例 0~1）。
-function downloadNode(url, dest, timeoutMs, onProgress) {
+// ---- 下载一段（支持 Range）----
+function downloadRange(proto, url, start, end, tmp, onChunk, onChunkFull) {
   return new Promise((resolve) => {
-    const proto = url.startsWith('https:') ? https : http;
-    const req = proto.request(url, { headers: { 'User-Agent': 'dsh-client' } }, (res) => {
+    const handler = (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const loc = res.headers.location;
+        res.resume();
         const next = /^https?:/.test(loc) ? loc : new URL(loc, url).toString();
-        res.resume();
-        const r2 = downloadNode(next, dest, timeoutMs, onProgress);
-        r2.then((v) => resolve(v));
+        downloadRange(proto, next, start, end, tmp, onChunk, onChunkFull).then(resolve);
         return;
       }
-      if (res.statusCode !== 200) {
-        res.resume();
-        resolve({ ok: false, err: 'HTTP ' + res.statusCode });
-        return;
-      }
-      const total = parseInt(res.headers['content-length'] || '0', 10);
+      const okCode = res.statusCode === 206 || res.statusCode === 200;
+      if (!okCode) { res.resume(); resolve({ ok: false, err: 'HTTP ' + res.statusCode }); return; }
+      const ws = fs.createWriteStream(tmp);
       let got = 0;
-      const out = fs.createWriteStream(dest);
-      let timer = null;
-      if (timeoutMs) {
-        timer = setTimeout(() => { out.destroy(); resolve({ ok: false, err: '超时(' + Math.round(timeoutMs / 1000) + 's)' }); }, timeoutMs);
-      }
-      const done = (ok, err) => {
-        if (timer) clearTimeout(timer);
-        out.end();
-        if (!ok) try { fs.unlinkSync(dest); } catch (e) {}
-        resolve({ ok, size: got, err });
-      };
       res.on('data', (c) => {
         got += c.length;
-        if (total && onProgress) onProgress(Math.min(1, got / total));
+        if (onChunk) onChunk(c.length);
+        if (start === undefined && onChunkFull) onChunkFull(got);
       });
-      res.on('error', (e) => done(false, e.message));
-      out.on('error', (e) => done(false, '写文件失败: ' + e.message));
-      out.on('finish', () => done(true));
-      res.pipe(out);
-    });
+      res.on('error', (e) => resolve({ ok: false, err: e.message }));
+      ws.on('error', (e) => resolve({ ok: false, err: '写盘: ' + e.message }));
+      ws.on('finish', () => resolve({ ok: true, size: got, end }));
+      res.pipe(ws);
+    };
+    let headers = { 'User-Agent': 'dsh-client' };
+    if (start !== undefined && end !== undefined) headers['Range'] = 'bytes=' + start + '-' + end;
+    const req = proto.request(url, { headers }, handler);
     req.setTimeout(15000, () => { req.destroy(new Error('连接超时')); });
     req.on('error', (e) => resolve({ ok: false, err: e.message }));
     req.end();
+  });
+}
+
+// 多线程分段下载：并发 N 段 + Range 分片，达到接近限速上限的吞吐。
+// 若源不支持 Range（返回全量200），退化为单连接整段下载。
+function downloadNode(url, dest, timeoutMs, onProgress) {
+  return new Promise((resolve) => {
+    const proto = url.startsWith('https:') ? https : http;
+    const probe = proto.request(url, { headers: { 'User-Agent': 'dsh-client', Range: 'bytes=0-0' } }, (pr) => {
+      if (pr.statusCode >= 300 && pr.statusCode < 400 && pr.headers.location) {
+        const loc = pr.headers.location;
+        pr.resume();
+        probeRange(/^https?:/.test(loc) ? loc : new URL(loc, url).toString(), proto, dest, timeoutMs, onProgress, resolve);
+        return;
+      }
+      const cr = pr.headers['content-range'] || '';
+      const m = /bytes \d+-\d+\/(\d+)/.exec(cr);
+      pr.resume();
+      if (m) return parallelDownload(url, proto, dest, parseInt(m[1], 10), timeoutMs, onProgress, resolve);
+      return singleDownload(url, proto, dest, timeoutMs, onProgress, resolve);
+    });
+    probe.setTimeout(15000, () => probe.destroy(new Error('探测超时')));
+    probe.on('error', (e) => resolve({ ok: false, err: e.message }));
+    probe.end();
+  });
+}
+
+function probeRange(url, proto, dest, timeoutMs, onProgress, resolve) {
+  const pr = proto.request(url, { headers: { 'User-Agent': 'dsh-client', Range: 'bytes=0-0' } }, (r2) => {
+    if (r2.statusCode >= 300 && r2.statusCode < 400 && r2.headers.location) {
+      const loc = r2.headers.location;
+      r2.resume();
+      probeRange(/^https?:/.test(loc) ? loc : new URL(loc, url).toString(), proto, dest, timeoutMs, onProgress, resolve);
+      return;
+    }
+    const cr = r2.headers['content-range'] || '';
+    const m = /bytes \d+-\d+\/(\d+)/.exec(cr);
+    r2.resume();
+    if (m) return parallelDownload(url, proto, dest, parseInt(m[1], 10), timeoutMs, onProgress, resolve);
+    return singleDownload(url, proto, dest, timeoutMs, onProgress, resolve);
+  });
+  pr.setTimeout(15000, () => pr.destroy(new Error('探测超时')));
+  pr.on('error', (e) => resolve({ ok: false, err: e.message }));
+  pr.end();
+}
+
+function parallelDownload(url, proto, dest, total, timeoutMs, onProgress, resolve) {
+  const N = 8;
+  const CHUNK = Math.ceil(total / N);
+  const tmpDir = path.join(app.getPath('temp'), 'dsh-upd-' + Date.now() + Math.floor(Math.random() * 100000));
+  let parts = [];
+  try {
+    fs.mkdirSync(tmpDir, { recursive: true });
+    for (let i = 0; i < N; i++) {
+      const s = i * CHUNK, e = Math.min((i + 1) * CHUNK - 1, total - 1);
+      if (s <= e) parts.push({ i, s, e, file: path.join(tmpDir, 'p' + i + '.bin'), ok: false });
+    }
+  } catch (e) { return singleDownload(url, proto, dest, timeoutMs, onProgress, resolve); }
+  let doneCount = 0, totalGot = 0;
+  const update = () => { if (onProgress) onProgress(Math.min(1, totalGot / total)); };
+  const finish = (ok, err) => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e2) {}
+    resolve({ ok, size: totalGot, err });
+  };
+  parts.forEach((pt) => {
+    const dl = (retry) => {
+      downloadRange(proto, url, pt.s, pt.e, pt.file, (n) => { totalGot += n; update(); }).then((r) => {
+        const want = pt.e - pt.s + 1;
+        if (r.ok && fs.existsSync(pt.file) && fs.statSync(pt.file).size >= want) {
+          pt.ok = true;
+        } else if (retry) { return dl(false); }
+        doneCount++;
+        if (doneCount >= parts.length) {
+          if (parts.every((p) => p.ok)) {
+            try {
+              const out = fs.createWriteStream(dest);
+              let wi = 0;
+              const writeNext = () => {
+                if (wi >= parts.length) { out.end(); setTimeout(() => resolve({ ok: true, size: total, err: '' }), 50); return; }
+                const rd = fs.createReadStream(parts[wi].file);
+                rd.on('error', () => finish(false, '拼接读失败'));
+                rd.on('end', () => { wi++; writeNext(); });
+                rd.pipe(out, { end: false });
+              };
+              writeNext();
+            } catch (e3) { finish(false, '拼接: ' + e3.message); }
+          } else {
+            finish(false, '分片失败(' + parts.filter((p) => !p.ok).map((p) => p.i).join(',') + ')');
+          }
+        }
+      });
+    };
+    dl(true);
+  });
+}
+
+function singleDownload(url, proto, dest, timeoutMs, onProgress, resolve) {
+  downloadRange(proto, url, undefined, undefined, dest, null, (n) => {
+    if (onProgress) onProgress(0); // 单连接无总量时不推进度，交给 doUpdate 的 size 校验
+  }).then((r) => {
+    resolve({ ok: r.ok, size: r.size, err: r.err });
   });
 }
 
