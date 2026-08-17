@@ -7,8 +7,8 @@
 
 - **DeepSeek-Harness-Desktop**：DSH（DeepSeek Harness）Windows 桌面客户端（Electron）
 - 远程仓库：`github.com/Dantezcx/DeepSeek-Harness-Desktop`（MIT，开源）
-- 本地开发目录：`D:\Claude code\DSH\DeepSeek-Harness-Desktop`
-- 本地测试安装（便携版）：`D:\Apps\dsh\dsh-client`——改代码后打包 `--win --dir`，覆盖其 `resources\app.asar` 即更新（需先退出客户端）
+- 本地开发目录：`D:\Claude Code\dsh\DeepSeek-Harness-Desktop`
+- 本地测试安装（便携版）：`D:\APP\DSH\dsh-client`——改代码后打包 `--win --dir`，覆盖其 `resources\app.asar` 即更新（需先退出客户端）
 
 ## 功能与实现要点
 
@@ -31,11 +31,11 @@
 ## 构建与测试
 
 - 依赖安装：`cd src && npm install`（node_modules 在本机）
-- 完整安装包：`cd src && npm run dist` → `release/install-dsh-v1.0.0.exe`
+- 完整安装包：`cd src && npm run dist` → `release/install-dsh-v1.2.0.exe`（按 package.json 的 version 生成）
 - 快速迭代：`node node_modules/electron-builder/cli.js --win --dir` → `release/win-unpacked/`，把 `resources/app.asar` 复制到本地测试安装目录
 - 已配置 `"npmRebuild": false`（纯 JS 无原生模块，勿改回）
 - 镜像/缓存环境变量（国内网络）：`npm_config_cache`、`ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/`、`ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/`
-- 打包若因沙箱权限失败（Access denied on D:\Apps）：需在更高权限模式下重试
+- 打包若因沙箱权限失败（Access denied on D:\APP）：需在更高权限模式下重试
 
 ## 约定
 
