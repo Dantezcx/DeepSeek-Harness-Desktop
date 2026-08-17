@@ -382,6 +382,73 @@ function applyTerminalBashPatch() {
   return { ok: true, changed: true, msg: '提速补丁已应用' };
 }
 
+// ---- OCR 图片放行补丁（dsh-plugin-ocr 依赖）----
+// 根因：dsh-host-apiproxy 在 prompt/selectModel 入口检查模型 inputModalities，
+// DeepSeek 无 image 能力 → 图片消息在进 agent loop 前就被拒（"当前模型不支持图片"）。
+// dsh-plugin-ocr 会在 agent/pre-step 把 image block 转成 OCR 文本，模型实际只收到
+// 文本，因此跳过该能力检查是安全且正确的。幂等；dsh 升级覆盖后客户端启动时自动重打。
+function applyOcrImagePatch() {
+  const target = path.join(NPM_GLOBAL_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-host-apiproxy', 'lib', 'index.js');
+  if (!fs.existsSync(target)) {
+    log('[ocrpatch] dsh-host-apiproxy not found: ' + target);
+    return { ok: false, changed: false, msg: 'dsh-host-apiproxy 未找到' };
+  }
+  let s = fs.readFileSync(target, 'utf8');
+  if (s.includes('[dsh-plugin-ocr patch]')) {
+    return { ok: true, changed: false, msg: '已打补丁（幂等跳过）' };
+  }
+  const before = s;
+  // 1) prompt 入口：MODEL_DOES_NOT_SUPPORT_IMAGES 拒绝 → 放行
+  s = s.replace(
+    /if \(modelInfo\.inputModalities !== void 0 && !modelInfo\.inputModalities\.includes\("image"\)\) return err\(request, \{\n(\s*)code: "attachment-error",/,
+    '/* [dsh-plugin-ocr patch] 放行图片（OCR 插件转文本） */\n$1if (false) return err(request, {\n$1code: "attachment-error",'
+  );
+  // 2) selectModel 入口：model-unavailable 拒绝 → 放行
+  s = s.replace(
+    /if \(info\.inputModalities !== void 0 && !info\.inputModalities\.includes\("image"\)\) return err\(request, \{\n(\s*)code: "model-unavailable",/,
+    '/* [dsh-plugin-ocr patch] 放行图片（OCR 插件转文本） */\n$1if (false) return err(request, {\n$1code: "model-unavailable",'
+  );
+  if (s === before) { log('[ocrpatch] 锚点未匹配，跳过'); return { ok: false, changed: false, msg: '锚点未匹配' }; }
+  fs.writeFileSync(target, s);
+  log('[ocrpatch] OCR 图片放行补丁已应用');
+  return { ok: true, changed: true, msg: 'OCR 图片放行补丁已应用' };
+}
+
+// ---- OCR 引擎自动部署（安装即用）----
+// OCR 引擎（PaddleOCR-json，约 250MB）随安装包通过 extraResources 打进
+// resources/ocr-engine。首次启动若 ~/.dsh/ocr 缺失则从安装包复制一份过去，
+// 使 dsh-plugin-ocr 立即可用（插件默认引擎路径即 ~/.dsh/ocr）。幂等：引擎
+// exe 存在即跳过；开发模式/未打包时 resources 无引擎，静默跳过。
+function ocrEngineDir() {
+  return path.join(process.env.USERPROFILE || '', '.dsh', 'ocr', 'PaddleOCR-json_v1.4.1');
+}
+function ensureOcrEngine() {
+  try {
+    const exe = path.join(ocrEngineDir(), 'PaddleOCR-json.exe');
+    if (fs.existsSync(exe)) return { ok: true, changed: false, msg: '引擎已就绪（幂等跳过）' };
+    const srcDir = path.join(process.resourcesPath, 'ocr-engine', 'PaddleOCR-json_v1.4.1');
+    if (!fs.existsSync(path.join(srcDir, 'PaddleOCR-json.exe'))) {
+      log('[ocr-engine] 安装包内无引擎资源（开发模式？），跳过自动部署');
+      return { ok: false, changed: false, msg: '安装包无引擎资源' };
+    }
+    const copyRec = (from, to) => {
+      const st = fs.statSync(from);
+      if (st.isDirectory()) {
+        fs.mkdirSync(to, { recursive: true });
+        for (const e of fs.readdirSync(from)) copyRec(path.join(from, e), path.join(to, e));
+      } else {
+        fs.copyFileSync(from, to);
+      }
+    };
+    copyRec(srcDir, ocrEngineDir());
+    log('[ocr-engine] OCR 引擎已部署到 ' + ocrEngineDir());
+    return { ok: true, changed: true, msg: 'OCR 引擎已部署' };
+  } catch (e) {
+    log('[ocr-engine] 部署失败: ' + e.message);
+    return { ok: false, changed: false, msg: '部署失败: ' + e.message };
+  }
+}
+
 // ---- boot ----
 async function bootWeb() {
   try { if (fixProfileBundles()) log('profile bundles fixed, service will use patched config'); } catch (e) {}
@@ -390,6 +457,16 @@ async function bootWeb() {
     const tp = applyTerminalBashPatch();
     if (tp.changed) { log('terminal-bash patched, restarting service'); await killByPort(PORT); }
   } catch (e) { log('terminal patch error: ' + e.message); }
+  // OCR 图片放行补丁：dsh-plugin-ocr 依赖（改了全局 dsh 包）
+  try {
+    const op = applyOcrImagePatch();
+    if (op.changed) { log('ocr-image patched, restarting service'); await killByPort(PORT); }
+  } catch (e) { log('ocr patch error: ' + e.message); }
+  // OCR 引擎部署：首次启动把安装包内资源复制到 ~/.dsh/ocr（安装即用，幂等）
+  try {
+    const oe = ensureOcrEngine();
+    if (!oe.ok && oe.msg !== '安装包无引擎资源') log('ocr-engine error: ' + oe.msg);
+  } catch (e) { log('ocr-engine error: ' + e.message); }
   const status = await ensureServer();
   if (status === 'timeout') {
     let diag = '(无日志)';

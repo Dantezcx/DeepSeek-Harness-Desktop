@@ -3,3 +3,5 @@ dist/
 release*/
 *.log
 .DS_Store
+# OCR 引擎本体（PaddleOCR-json，约 250MB，本地打包资源，不进 git）
+src/ocr-engine/

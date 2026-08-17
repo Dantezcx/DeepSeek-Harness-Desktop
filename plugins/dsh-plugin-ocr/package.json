@@ -1,0 +1,8 @@
+{
+  "name": "dsh-plugin-ocr",
+  "version": "1.0.0",
+  "description": "DSH 本地 OCR：把会话里的图片转成文本再发给模型（DeepSeek 无视觉模块）",
+  "type": "module",
+  "main": "./index.mjs",
+  "license": "MIT"
+}
