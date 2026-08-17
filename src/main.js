@@ -3,6 +3,8 @@ const { spawn } = require('child_process');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 const PORT = 8123;
 const APP_VERSION = (() => {
@@ -526,23 +528,95 @@ function compareVersions(a, b) {
   }
   return 0;
 }
+// GitHub 网页 releases/latest 会 302 重定向到 /releases/tag/<tag>，
+// 不受 api.github.com 匿名限流（60 次/小时/IP，超限返回 403）影响。
+// 跟随重定向后从最终 URL 解析最新 tag；失败抛错由调用方兜底。
+async function latestTagFromRedirect() {
+  const res = await fetch('https://github.com/' + UPDATE_REPO + '/releases/latest', {
+    redirect: 'follow',
+    signal: AbortSignal.timeout(15000),
+  });
+  const m = (res.url || '').match(/\/releases\/tag\/([^/?#]+)/);
+  if (!m) throw new Error('无法解析最新版本');
+  return String(m[1]).replace(/^v/i, '');
+}
+
 async function checkUpdate() {
   try {
-    const res = await fetch('https://api.github.com/repos/' + UPDATE_REPO + '/releases/latest', {
-      headers: { 'User-Agent': 'dsh-client', Accept: 'application/vnd.github+json' },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const j = await res.json();
-    const latest = String(j.tag_name || '').replace(/^v/i, '');
+    // 优先 GitHub API（可带更新说明）；遇限流 403 或其它失败时回退到
+    // releases/latest 网页重定向，避免"检查更新失败 HTTP 403"。
+    let latest = '', notes = '';
+    try {
+      const res = await fetch('https://api.github.com/repos/' + UPDATE_REPO + '/releases/latest', {
+        headers: { 'User-Agent': 'dsh-client', Accept: 'application/vnd.github+json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        latest = String(j.tag_name || '').replace(/^v/i, '');
+        notes = String(j.body || '').slice(0, 600);
+      } else {
+        log('checkUpdate: API HTTP ' + res.status + ' (rate-limited?), fallback to redirect');
+      }
+    } catch (e) {
+      log('checkUpdate: API error ' + e.message + ', fallback to redirect');
+    }
+    if (!latest) latest = await latestTagFromRedirect();
     const hasUpdate = compareVersions(latest, APP_VERSION) > 0;
     log('checkUpdate: current=' + APP_VERSION + ' latest=' + latest + ' has=' + hasUpdate);
-    return { ok: true, hasUpdate, current: APP_VERSION, latest, url: j.html_url, notes: String(j.body || '').slice(0, 600) };
+    return { ok: true, hasUpdate, current: APP_VERSION, latest, url: 'https://github.com/' + UPDATE_REPO + '/releases/tag/v' + latest, notes };
   } catch (e) {
     log('checkUpdate error: ' + e.message);
     return { ok: false, msg: '检查更新失败: ' + e.message };
   }
 }
+// Node 直连下载：不走 Electron/系统代理（避免 Clash fake-ip 拦截 GitHub）。
+// 返回 {ok, size, err}；带超时与进度回调（比例 0~1）。
+function downloadNode(url, dest, timeoutMs, onProgress) {
+  return new Promise((resolve) => {
+    const proto = url.startsWith('https:') ? https : http;
+    const req = proto.request(url, { headers: { 'User-Agent': 'dsh-client' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        const loc = res.headers.location;
+        const next = /^https?:/.test(loc) ? loc : new URL(loc, url).toString();
+        res.resume();
+        const r2 = downloadNode(next, dest, timeoutMs, onProgress);
+        r2.then((v) => resolve(v));
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        resolve({ ok: false, err: 'HTTP ' + res.statusCode });
+        return;
+      }
+      const total = parseInt(res.headers['content-length'] || '0', 10);
+      let got = 0;
+      const out = fs.createWriteStream(dest);
+      let timer = null;
+      if (timeoutMs) {
+        timer = setTimeout(() => { out.destroy(); resolve({ ok: false, err: '超时(' + Math.round(timeoutMs / 1000) + 's)' }); }, timeoutMs);
+      }
+      const done = (ok, err) => {
+        if (timer) clearTimeout(timer);
+        out.end();
+        if (!ok) try { fs.unlinkSync(dest); } catch (e) {}
+        resolve({ ok, size: got, err });
+      };
+      res.on('data', (c) => {
+        got += c.length;
+        if (total && onProgress) onProgress(Math.min(1, got / total));
+      });
+      res.on('error', (e) => done(false, e.message));
+      out.on('error', (e) => done(false, '写文件失败: ' + e.message));
+      out.on('finish', () => done(true));
+      res.pipe(out);
+    });
+    req.setTimeout(15000, () => { req.destroy(new Error('连接超时')); });
+    req.on('error', (e) => resolve({ ok: false, err: e.message }));
+    req.end();
+  });
+}
+
 async function doUpdate() {
   try {
     const chk = await checkUpdate();
@@ -551,21 +625,26 @@ async function doUpdate() {
     const exeName = 'install-dsh-v' + chk.latest + '.exe';
     const url = 'https://github.com/' + UPDATE_REPO + '/releases/download/v' + chk.latest + '/' + exeName;
     const tmp = path.join(app.getPath('temp'), 'dsh-update-' + chk.latest + '.exe');
-    // 下载：直连 + GitHub 镜像兜底（国内网络）
-    let saved = false;
-    for (const m of ['https://ghproxy.net/', 'https://ghfast.top/', 'https://gh-proxy.com/', '']) {
-      try {
-        const res = await fetch(m + url, { signal: AbortSignal.timeout(600000), redirect: 'follow' });
-        if (!res.ok) { log('update download ' + (m || '直连') + ' HTTP ' + res.status); continue; }
-        const buf = Buffer.from(await res.arrayBuffer());
-        fs.writeFileSync(tmp, buf);
+    // 下载：直连 + GitHub 镜像兜底（用 Node 直连，不走系统代理）
+    let saved = false, lastErr = '';
+    const mirrors = ['https://ghproxy.net/', 'https://ghfast.top/', 'https://gh-proxy.com/', ''];
+    for (const m of mirrors) {
+      const full = m + url;
+      log('update download start: ' + (m || '直连') + ' (Node 直连)');
+      const r = await downloadNode(full, tmp, 180000, (p) => {
+        try { barView && barView.webContents && barView.webContents.send('update:progress', { percent: Math.round(p * 100), mirror: m || '直连' }); } catch (e) {}
+      });
+      if (r.ok && fs.existsSync(tmp) && fs.statSync(tmp).size > 100000) {
         saved = true;
-        log('update downloaded via ' + (m || '直连') + ' ' + Math.round(buf.length / 1024 / 1024) + 'MB');
+        log('update downloaded via ' + (m || '直连') + ' ' + Math.round(r.size / 1024 / 1024) + 'MB');
         break;
-      } catch (e) { log('update download ' + (m || '直连') + ' failed: ' + e.message); }
+      }
+      lastErr = m + ':' + (r.err || '文件异常');
+      log('update download ' + (m || '直连') + ' failed: ' + (r.err || '文件异常'));
+      if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) {} }
     }
-    if (!saved) return { ok: false, msg: '下载安装包失败（网络受限），请稍后重试或手动下载' };
-    // 静默安装（NSIS /S），短暂延迟后退出客户端，安装器完成覆盖；重开即新版
+    if (!saved) return { ok: false, msg: '下载安装包失败（' + lastErr + '），请稍后重试或手动下载安装包' };
+    // 静默安装（NSIS /S），短暂延迟后退出客户端
     const c = spawn(tmp, ['/S'], { detached: true, stdio: 'ignore' });
     c.on('error', (e) => log('update spawn error: ' + e.message));
     c.unref();

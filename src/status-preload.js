@@ -5,4 +5,5 @@ contextBridge.exposeInMainWorld('statusApi', {
   quit: () => ipcRenderer.invoke('ui:quit'),
   checkUpdate: () => ipcRenderer.invoke('update:check'),
   doUpdate: () => ipcRenderer.invoke('update:do'),
+  onUpdateProgress: (cb) => { ipcRenderer.on('update:progress', (_e, p) => cb && cb(p)); },
 });

@@ -94,6 +94,12 @@
       updating = false; $('update').disabled = false; $('update').textContent = '更新';
     }
   };
+  // 下载进度提示：main 进程经 update:progress 推送
+  window.statusApi.onUpdateProgress && window.statusApi.onUpdateProgress((p) => {
+    if (p && typeof p.percent === 'number') {
+      $('update').textContent = '下载 ' + p.percent + '%';
+    }
+  });
 </script>
 </body>
 </html>
