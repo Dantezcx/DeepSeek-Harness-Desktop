@@ -356,9 +356,38 @@ function fixProfileBundles() {
   return false;
 }
 
+// ---- terminal-bash 提速补丁（命令执行 3.5s → 50ms 快速通道）----
+// 根因：dsh-terminal-bash 的 CONTROLLED_PROMPT 是 "dsh> "，而上层
+// dsh-tool-bash-persistent 把 PS1 设为 __DSH_PERSISTENT_BASH_PROMPT__，
+// 两边暗号对不上，底层只能等 3.5s 静默超时兜底。统一暗号即恢复原生快速通道。
+// 幂等；修改的是全局 dsh 包（npm 升级 dsh 后会被覆盖，客户端启动时自动重打）。
+function applyTerminalBashPatch() {
+  const target = path.join(NPM_GLOBAL_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-terminal-bash', 'lib', 'index.js');
+  if (!fs.existsSync(target)) {
+    log('[tpatch] dsh-terminal-bash not found: ' + target);
+    return { ok: false, changed: false, msg: 'dsh-terminal-bash 未找到' };
+  }
+  let s = fs.readFileSync(target, 'utf8');
+  if (s.includes('__DSH_PERSISTENT_BASH_PROMPT__ ') && !s.includes('CONTROLLED_PROMPT = "dsh> "')) {
+    return { ok: true, changed: false, msg: '已修复（幂等跳过）' };
+  }
+  const before = s;
+  s = s.replace('const CONTROLLED_PROMPT = "dsh> ";', 'const CONTROLLED_PROMPT = "__DSH_PERSISTENT_BASH_PROMPT__ ";');
+  s = s.replace('Math.max(0, 6 - this.promptTail.length)', 'Math.max(0, CONTROLLED_PROMPT.length - this.promptTail.length)');
+  if (s === before) { log('[tpatch] 锚点未匹配，跳过'); return { ok: false, changed: false, msg: '锚点未匹配' }; }
+  fs.writeFileSync(target, s);
+  log('[tpatch] terminal-bash 提速补丁已应用');
+  return { ok: true, changed: true, msg: '提速补丁已应用' };
+}
+
 // ---- boot ----
 async function bootWeb() {
   try { if (fixProfileBundles()) log('profile bundles fixed, service will use patched config'); } catch (e) {}
+  // 终端提速补丁：改了全局 dsh 包，若服务已在运行需重启加载新代码
+  try {
+    const tp = applyTerminalBashPatch();
+    if (tp.changed) { log('terminal-bash patched, restarting service'); await killByPort(PORT); }
+  } catch (e) { log('terminal patch error: ' + e.message); }
   const status = await ensureServer();
   if (status === 'timeout') {
     let diag = '(无日志)';
